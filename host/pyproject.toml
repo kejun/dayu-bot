@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dayu-bridge"
+version = "0.1.0"
+description = "Host-side connector: ESP32 voice terminal -> Hermes Agent -> iCTRL (iPhone)"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12",
+    "cryptography>=42",   # iCTRL LAN pairing (X25519)
+]
+
+[project.scripts]
+bridge = "bridge.cli:main"
+
+[tool.setuptools]
+packages = ["bridge"]

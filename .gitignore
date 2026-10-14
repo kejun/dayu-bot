@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# 本地配置与密钥（绝不入库）
+config.json
+.env
+*.token
+.ictrl/
+
+# ESP-IDF 构建产物
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+
+# 日志与临时
+*.log
+logs/
