@@ -66,3 +66,27 @@ Hermes 会读 `GET /skill`、`GET /schema`，从设备下载客户端，发起�
 | UI 调用连续超时 | `reset`，然后每几秒轮询 `logs` 直到卡住的调用结束（15–45s），别发长 `sleep` |
 | 屏幕锁屏 | `unlock` 只点亮屏幕；需要密码时要用户处理 |
 | 只有 `logs`/`config`/`reset` 有响应 | UI 队列被卡住的调用占住，正常——用它诊断 |
+
+## iLoader 登录 Apple ID 失败（anisette）
+
+症状：`Failed to log in to Apple ID` → `Failed to get anisette data` →
+`Anisette provisioning failed` → `unknown session (-45025)`。
+
+原因：公用 anisette 服务器不稳定（`ani.sidestore.io` 时会 502），或代理干扰了
+`gsa.apple.com` 的会话。**解决：本地自建 anisette 服务。**
+
+```bash
+colima start                     # 重启后需要重新启动 colima
+docker run -d --name anisette -p 6969:6969 \
+  --restart unless-stopped dadoum/anisette-v3-server
+```
+
+iLoader → Settings → **Anisette Server** → 自定义填 **`http://127.0.0.1:6969`**
+（带 `http` 前缀会被原样使用，否则 iLoader 会补 `https://`）→ 再点
+**Reset anisette state** 清掉坏会话 → 重新登录。
+
+若仍失败，临时关闭系统代理（Clash）再试：Apple 认证流量被代理接管会导致
+会话不一致。
+
+> 备选公用服务器（不稳定）：`ani.stikstore.app`、`ani.sidestore.zip`、
+> `ani.xu30.top`、`ani.wedotstud.io`。
