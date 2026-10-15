@@ -178,3 +178,22 @@ zip -q -r -X ~/Downloads/ictrl/iCTRLUITests-Runner-patched.ipa Payload
 再用 iLoader → Import IPA 装 `iCTRLUITests-Runner-patched.ipa`。
 
 > 这是绕过 isideload 校验的权宜手段；iCTRL 官方路线仍是 SideStore。
+
+### 症状 E：SideStore 登录报 `-1005`（kCFURLErrorNetworkConnectionLost）
+
+SideStore 默认走远程 anisette 服务器 `ani.sidestore.io`
+（`AppConstants.Anisette.Servers.defaultServerURL`），而它**时好时坏**
+（实测反复出现 000 / 502 / 200），连不上就报网络中断 `-1005`。
+
+**修复：改用设备端 anisette（不依赖任何远程服务器）。**
+
+```
+SideStore → 设置 → Advanced → User Customizations → ANISETTE
+  → 打开「On-Device Anisette」("Run ADI emulation directly on device
+     instead of remote servers") → 确认重启
+  → 需要时再点「Reset adi.pb」清掉 keychain 里的坏 provisioning 数据
+  → 重启 SideStore 后重新登录
+```
+
+配合症状 D 的 Client Info（Android 身份），两个错误一起解决：
+`-80045` 是 client info 被拒，`-1005` 是 anisette 服务器连不上。
