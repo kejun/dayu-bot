@@ -99,5 +99,23 @@ iLoader → Settings → **Anisette Server** → 自定义填 **`http://127.0.0.
   临时关掉系统代理再登录，或把 `*.apple.com` 加入代理例外。
 - 连续失败可能触发 Apple 临时限流，等 10–15 分钟再试。
 
+### 症状 C：`2.3.8` 报 `Failed to request /v3/client_info` / `error sending request`
+
+`2.3.8` 默认用内置 anisette 服务器 `ani.jkcoxson.com`（另一个是
+`ani.stikstore.app`）。实测这台机器上该服务器**直连稳定（0.7–2s）**，
+但**经 Clash 代理又慢（3–5s）又间歇性失败（连接直接断）**，导致
+`error sending request`。
+
+→ **关掉 Clash 系统代理**（iLoader 从 Finder 启动，读的是 macOS 系统代理），
+或把 `ani.jkcoxson.com`、`ani.stikstore.app` 加进代理例外。
+
+验证命令：
+```bash
+for i in 1 2 3; do
+  curl -s -o /dev/null -w "直连 %{http_code}/%{time_total}s\n" --noproxy '*' https://ani.jkcoxson.com/v3/client_info
+  curl -s -o /dev/null -w "代理 %{http_code}/%{time_total}s\n" -x http://127.0.0.1:7892 https://ani.jkcoxson.com/v3/client_info
+done
+```
+
 > 备选公用 anisette 服务器（不稳定）：`ani.stikstore.app`、`ani.sidestore.zip`、
 > `ani.xu30.top`、`anisette.wedotstud.io`。
