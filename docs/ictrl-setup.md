@@ -67,26 +67,37 @@ Hermes 会读 `GET /skill`、`GET /schema`，从设备下载客户端，发起�
 | 屏幕锁屏 | `unlock` 只点亮屏幕；需要密码时要用户处理 |
 | 只有 `logs`/`config`/`reset` 有响应 | UI 队列被卡住的调用占住，正常——用它诊断 |
 
-## iLoader 登录 Apple ID 失败（anisette）
+## iLoader 登录 Apple ID 失败
 
-症状：`Failed to log in to Apple ID` → `Failed to get anisette data` →
-`Anisette provisioning failed` → `unknown session (-45025)`。
+**先确认版本：必须用 `2.3.8` 或更新。**
+`2.3.7` 存在已知 bug，登录时会对 `gsa.apple.com` 返回
+`503 Service Temporarily Unavailable`；`2.3.8` 已修复（见其 release notes）。
 
-原因：公用 anisette 服务器不稳定（`ani.sidestore.io` 时会 502），或代理干扰了
-`gsa.apple.com` 的会话。**解决：本地自建 anisette 服务。**
+- `2.3.8` 起 **自定义 anisette 服务器不再可用**，会自动改用内置的两个之一。
+- `2.3.8` 登录会**要求重新做一次 2FA**：受信任设备 2FA 和未开 2FA 的账号正常，
+  **短信（SMS）2FA 仍不可用**。
+
+### 症状 A：`unknown session (-45025)` / `Anisette provisioning failed`
+
+公用 anisette 服务器不稳定（`ani.sidestore.io` 时会 502）。
+**仅 `2.3.7` 及更早**可用下面方式自建本地服务：
 
 ```bash
-colima start                     # 重启后需要重新启动 colima
+colima start                     # 重启后需重新启动 colima
 docker run -d --name anisette -p 6969:6969 \
   --restart unless-stopped dadoum/anisette-v3-server
 ```
 
 iLoader → Settings → **Anisette Server** → 自定义填 **`http://127.0.0.1:6969`**
 （带 `http` 前缀会被原样使用，否则 iLoader 会补 `https://`）→ 再点
-**Reset anisette state** 清掉坏会话 → 重新登录。
+**Reset anisette state** → 重新登录。
 
-若仍失败，临时关闭系统代理（Clash）再试：Apple 认证流量被代理接管会导致
-会话不一致。
+### 症状 B：`HTTP 503 ... gsa.apple.com/grandslam/GsService2`
 
-> 备选公用服务器（不稳定）：`ani.stikstore.app`、`ani.sidestore.zip`、
-> `ani.xu30.top`、`ani.wedotstud.io`。
+- **首选：升级到 iLoader `2.3.8`**（专门修这个）。
+- 若仍失败，检查是否走了代理：`gsa.apple.com` 经机房/VPN 出口 IP 会被 Apple 拒。
+  临时关掉系统代理再登录，或把 `*.apple.com` 加入代理例外。
+- 连续失败可能触发 Apple 临时限流，等 10–15 分钟再试。
+
+> 备选公用 anisette 服务器（不稳定）：`ani.stikstore.app`、`ani.sidestore.zip`、
+> `ani.xu30.top`、`anisette.wedotstud.io`。
