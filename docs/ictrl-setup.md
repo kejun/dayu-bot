@@ -119,3 +119,27 @@ done
 
 > 备选公用 anisette 服务器（不稳定）：`ani.stikstore.app`、`ani.sidestore.zip`、
 > `ani.xu30.top`、`anisette.wedotstud.io`。
+
+### 症状 D：SideStore 登录 Apple ID 报 `-80045`（0.7.0-alpha 及更早）
+
+Apple 的 GSA 现在**拒绝第三方 anisette 服务器发来的 macOS client info**，返回
+`-80045`。iLoader 2.3.7+ 与 SideStore 的修复都是**改用 Android 身份**
+（SideStore PR #1657，2026-10-15 才合并，尚未进入任何已发布版本）。
+
+**手动修复（0.7.0-alpha 自带该设置页）：**
+
+SideStore → **设置 → 高级（Advanced）→ Anisette** → 把 **`Client Info`**
+（headerKey `X-Mme-Client-Info`）改成：
+
+```
+<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>
+```
+
+- **末尾不要有空格或换行**——粘贴带换行会让认证接口返回空响应。
+- 保存后重启 SideStore，再登录。
+
+> 旧值（会被 GSA 拒绝，若看到就是它）：
+> `Constants.Anisette.defaultClientInfo`、
+> `<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>`。
+>
+> 相关 issue：#1657（修复）、#1658 / #1652（仍复现）。
