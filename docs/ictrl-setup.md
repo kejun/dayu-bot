@@ -158,3 +158,23 @@ SideStore → **设置 → 高级（Advanced）→ Anisette** → 把 **`Client 
 
 > 验证方法：装好后**立刻启动 runner**。能起来即签名正确；若报
 > `mapped file has no cdhash` 则说明没签上，回退 SideStore。
+
+### iLoader 报 `Invalid bundle: Extension ... is not part of the main app bundle identifier`
+
+isideload 的 `update_bundle_id()` 要求扩展 bundle id 是主 App id 的**严格子前缀**
+（`starts_with(main) && len > len(main)`），而 iCTRL runner 的
+`PlugIns/iCTRLUITests.xctest` 与主 App **同名**，因此被拒。
+
+**权宜修复**：把 `.xctest` 的 `CFBundleIdentifier` 改成子 id 再重打包：
+
+```bash
+rm -rf /tmp/runner_patch && mkdir -p /tmp/runner_patch && cd /tmp/runner_patch
+unzip -q ~/Downloads/ictrl/iCTRLUITests-Runner.ipa
+X="Payload/iCTRLUITests-Runner.app/PlugIns/iCTRLUITests.xctest/Info.plist"
+/usr/libexec/PlistBuddy -c "Set CFBundleIdentifier com.openminis.ictrl.uitests.xctrunner.iCTRLUITests" "$X"
+zip -q -r -X ~/Downloads/ictrl/iCTRLUITests-Runner-patched.ipa Payload
+```
+
+再用 iLoader → Import IPA 装 `iCTRLUITests-Runner-patched.ipa`。
+
+> 这是绕过 isideload 校验的权宜手段；iCTRL 官方路线仍是 SideStore。
