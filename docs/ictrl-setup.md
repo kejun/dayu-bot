@@ -143,3 +143,18 @@ SideStore → **设置 → 高级（Advanced）→ Anisette** → 把 **`Client 
 > `<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>`。
 >
 > 相关 issue：#1657（修复）、#1658 / #1652（仍复现）。
+
+## 路线选择：SideStore 卡住时，用 iLoader 直接装 runner
+
+当 SideStore 登录被 Apple 挡住（`-80045` / `-1005`，见症状 D）时，可以绕过它：
+
+**iLoader → Import IPA → `iCTRLUITests-Runner.ipa`**（iPhone 用 USB 连接）。
+
+为什么可行：isideload 的 `isideload/src/sideload/bundle.rs` 会把 **`PlugIns/` 下
+的内容全部当作 app extension 签名**，而 runner 的嵌套测试包正好是
+`PlugIns/iCTRLUITests.xctest`，因此会被一并签名。
+
+代价：iLoader 没有 7 天自动续签，免费证书到期需重新 Import。
+
+> 验证方法：装好后**立刻启动 runner**。能起来即签名正确；若报
+> `mapped file has no cdhash` 则说明没签上，回退 SideStore。
