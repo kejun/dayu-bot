@@ -15,6 +15,12 @@
 - [x] 终端协议 v1 定义 + 网关骨架 `server.py`
 - [x] `bridge doctor / pair / phone / ask / install-skill / serve`
 
+已完成（2026-10-16，Xcode 路线 + bridge 走 curl）：
+
+- [x] Xcode 27.1 构建 iCTRL（免费 Apple ID 自动签名，bundle id 以 `.xctrunner` 结尾）
+- [x] runner 在 iPhone 上运行（`xcodebuild test-without-building`）
+- [x] `bridge ask "…"` → Hermes → iCTRL → iPhone 全链路跑通
+
 被外部条件阻塞：
 
 - [ ] iPhone 安装并运行 iCTRL（签名 + DDI + 配对）→ 阶段 1 的微信/邮件实测
@@ -28,9 +34,9 @@
 
 **目标**：在 Mac 上输入文字，完成手机微信发送与邮件查看，且**无独立业务 API**。
 
-- [ ] iPhone 装好 iCTRL，`bridge pair` 成功
-- [ ] `bridge phone device_info` 返回手机信息
-- [ ] `bridge install-skill` 把设备 `/skill` 交给 Hermes
+- [x] iPhone 装好 iCTRL，`bridge pair` 成功
+- [x] `bridge phone device_info` 返回手机信息
+- [x] `bridge install-skill` 把设备 `/skill` 交给 Hermes
 - [ ] `bridge ask "给张三发微信：今晚8点开会"` → iCTRL 实际操作手机并核查
 - [ ] `bridge ask "打开手机邮件，看看今天有没有重要邮件"` → 基于实际读到内容作答
 - [ ] 交回控制权（回到发起 App）
