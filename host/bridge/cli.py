@@ -46,6 +46,13 @@ def cmd_doctor(cfg: Config, args) -> int:
     print(f"[..] Hermes skill 目标目录: {HERMES_SKILL_DIR}")
     print(f"[{'OK' if (HERMES_SKILL_DIR / 'SKILL.md').exists() else '..'}] "
           f"iCTRL skill 已安装: {(HERMES_SKILL_DIR / 'SKILL.md').exists()}")
+
+    from .speech import WhisperCpp
+    stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
+    sok, swhy = stt.available()
+    print(f"[{'OK' if sok else '!!'}] 语音识别 (whisper.cpp): {swhy}")
+    ok &= sok
+
     print("== 结论:", "全部就绪" if ok else "有未就绪项，见上面 !! ==")
     return 0 if ok else 1
 
@@ -113,10 +120,14 @@ def cmd_install_skill(cfg: Config, args) -> int:
 def cmd_serve(cfg: Config, args) -> int:
     import logging
     from .server import Bridge
+    from .speech import WhisperCpp
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout, args=args.hermes_args or [])
-    bridge = Bridge(cfg, agent, _client(cfg))
+    stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
+    ok, why = stt.available()
+    print(f"语音识别: {'OK' if ok else '不可用'} — {why}")
+    bridge = Bridge(cfg, agent, _client(cfg), stt=stt if ok else None)
     print(f"网关监听 ws://{cfg.bind}:{cfg.port}  手机={cfg.ictrl_host}")
     try:
         asyncio.run(bridge.serve_forever())

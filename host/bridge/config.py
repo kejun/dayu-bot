@@ -45,6 +45,11 @@ class Config:
     hermes_bin: str = "hermes"
     agent_timeout: int = 300            # 秒
 
+    # --- 语音识别（whisper.cpp，本地免费）---
+    stt_binary: str = "whisper-cli"
+    stt_model: Path = field(default_factory=lambda: Path.home() / ".dayu" / "models" / "ggml-small.bin")
+    stt_language: str = "zh"
+
     # --- 其它 ---
     timezone: str = "Asia/Shanghai"     # PRD §6 默认时区
     log_dir: Path = field(default_factory=lambda: DEFAULT_LOG_DIR)
@@ -62,6 +67,9 @@ class Config:
             hermes_bin=_env("HERMES_BIN", base.hermes_bin) or base.hermes_bin,
             agent_timeout=int(_env("AGENT_TIMEOUT", str(base.agent_timeout))
                               or base.agent_timeout),
+            stt_binary=_env("STT_BINARY", base.stt_binary) or base.stt_binary,
+            stt_model=Path(_env("STT_MODEL", str(base.stt_model)) or base.stt_model),
+            stt_language=_env("STT_LANGUAGE", base.stt_language) or base.stt_language,
             timezone=_env("BRIDGE_TZ", base.timezone) or base.timezone,
             log_dir=Path(_env("BRIDGE_LOG_DIR", str(DEFAULT_LOG_DIR)) or DEFAULT_LOG_DIR),
         )
