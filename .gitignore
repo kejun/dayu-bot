@@ -21,3 +21,10 @@ firmware/managed_components/
 # 日志与临时
 *.log
 logs/
+
+# ds-bot 固件构建产物
+firmware/*/build/
+firmware/*/managed_components/
+firmware/*/sdkconfig
+firmware/*/sdkconfig.old
+firmware/*/dependencies.lock
