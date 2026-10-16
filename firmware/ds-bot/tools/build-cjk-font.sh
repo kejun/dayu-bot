@@ -28,6 +28,7 @@ npx --yes lv_font_conv \
     --lv-font-name "dsbot_font_${SIZE}" \
     --lv-include lvgl.h \
     --range 0x20-0x7F \
+    --range 0x2000-0x206F \
     --range 0x3000-0x303F \
     --range 0xFF00-0xFF5F \
     --symbols "$SYMBOLS" \
