@@ -82,3 +82,7 @@ class WhisperCpp:
             int(fmt.get("rate", 16000)), int(fmt.get("channels", 1)),
             int(fmt.get("bits", 16)),
         )
+
+    async def __call__(self, pcm: bytes, fmt: dict) -> str:
+        """让对象本身就能当作 SttFn 调用（Bridge 传的是 self.stt(...)）。"""
+        return await self.transcribe(pcm, fmt)

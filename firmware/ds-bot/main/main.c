@@ -118,8 +118,12 @@ static void on_net_msg(const char *type, const char *json)
         ui_set_net_locked("已连接主机");
     } else if (!strcmp(tt, "notice")) {
         cJSON *txt = cJSON_GetObjectItem(root, "text");
-        if (cJSON_IsString(txt)) {
-            ESP_LOGW(TAG, "notice: %s", txt->valuestring);
+        cJSON *lvl = cJSON_GetObjectItem(root, "level");
+        const char *lv = cJSON_IsString(lvl) ? lvl->valuestring : "warn";
+        ESP_LOGW(TAG, "notice[%s]: %s", lv, cJSON_IsString(txt) ? txt->valuestring : "");
+        /* 出错时别一直卡在「处理中」 */
+        if (!strcmp(lv, "error")) {
+            ui_set_state_locked(UI_FAIL);
         }
     } else if (!strcmp(tt, "status")) {
         cJSON *st = cJSON_GetObjectItem(root, "state");

@@ -144,14 +144,17 @@ class Bridge:
                 await self._send(ws, P.notice("warn", "主机未配置语音识别（STT）"))
                 return
             await self._send(ws, P.status(rid, State.PROCESSING.value))
+            log.info("STT: %d 字节音频 …", len(data))
             try:
                 text = await self.stt(data, self.cfg.audio().as_dict())
             except Exception as e:  # noqa: BLE001
+                log.warning("识别失败: %r", e)
                 await self._send(ws, P.notice("error", f"识别失败：{e}"))
                 return
             if not text.strip():
                 await self._send(ws, P.notice("warn", "没有识别到内容，未提交"))
                 return
+            log.info("STT 结果: %r → 提交任务 %s", text.strip(), rid)
             self.tasks.submit(rid, text.strip(), source="voice")
 
         elif t == P.Msg.ANSWER:
