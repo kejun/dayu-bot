@@ -197,3 +197,45 @@ SideStore → 设置 → Advanced → User Customizations → ANISETTE
 
 配合症状 D 的 Client Info（Android 身份），两个错误一起解决：
 `-80045` 是 client info 被拒，`-1005` 是 anisette 服务器连不上。
+
+## DDI 下载失败（TLS 错误）——用 afcclient 直接写入 App 容器
+
+iCTRL 的 DDI 从 **GitHub** 下载（`doronz88/DeveloperDiskImage` 镜像），
+国内直连 `raw.githubusercontent.com` 会 TLS 报错。
+
+**iOS 27 需要 Cryptex 版 DDI**（5 个文件）：
+```
+BuildManifest.plist  Image.dmg  Image.dmg.trustcache
+Image.dmg.cryptex_info  Image.dmg.root_hash
+```
+来源：`https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/`
+
+### 绕过办法：直接把文件写进 App 容器
+
+App 存放路径（`DeveloperDiskImageStore`）：
+```
+<App容器>/Library/Application Support/DDI/Xcode_iOS_DDI_Cryptex/
+```
+
+用 `afcclient` 的 HouseArrest 访问容器（注意 isideload 会改写 bundle id，
+后缀是 team id，可用 `ideviceinstaller -l` 或崩溃日志确认真实 id）：
+
+```bash
+UDID=$(idevice_id -l | head -1)
+BID=com.openminis.ictrl.<TEAMID>          # 例如 com.openminis.ictrl.NBYSH5B496
+printf 'ls\n' | afcclient --container "$BID" -u "$UDID"     # 验证可访问
+
+{ echo 'mkdir "Library/Application Support/DDI/Xcode_iOS_DDI_Cryptex"'
+  for f in BuildManifest.plist Image.dmg Image.dmg.trustcache Image.dmg.cryptex_info Image.dmg.root_hash; do
+    echo "put /path/to/ddi/$f \"Library/Application Support/DDI/Xcode_iOS_DDI_Cryptex/$f\""
+  done
+} | afcclient --container "$BID" -u "$UDID"
+```
+
+> afcclient 按空格切分参数，**含空格的路径必须加引号**。
+
+### 备选：让手机走 Mac 的代理下载
+
+Clash 只监听 `127.0.0.1` 时，可在 Mac 上转发 `0.0.0.0:7893 → 127.0.0.1:7892`
+（见 `~/.dayu/portfwd.py`），再把手机 Wi-Fi 代理设为 `192.168.1.13:7893`。
+（注意：`curl --noproxy '*'` 会覆盖 `-x`，测试时别一起用。）
