@@ -16,8 +16,8 @@ extern "C" {
 #if defined(LV_BIG_ENDIAN_SYSTEM) && LV_BIG_ENDIAN_SYSTEM
 #error "These assets target little-endian MCUs such as ESP32."
 #endif
-#define BLUEBOT_WIDTH 128
-#define BLUEBOT_HEIGHT 128
+#define BLUEBOT_WIDTH 256
+#define BLUEBOT_HEIGHT 256
 typedef lv_image_dsc_t bluebot_image_dsc_t;
 
 typedef enum {
