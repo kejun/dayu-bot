@@ -18,6 +18,7 @@
 #include "bluebot_assets.h"
 #include "bluebot_player.h"
 #include "dsbot_font_32.h"
+#include "audio.h"
 
 static const char *TAG = "ds-bot";
 
@@ -70,18 +71,28 @@ static void ui_set_state(ui_state_t st)
     lv_label_set_text(s_label, k_text[st]);
 }
 
-/* 点屏幕 → 切到下一个状态（触摸验证用；后续由语音/任务状态驱动） */
-static void on_screen_clicked(lv_event_t *e)
+/* 触摸：按住录音，松手回放（验证 ES7210 麦克风 + ES8311 扬声器） */
+static void on_screen_event(lv_event_t *e)
 {
-    (void)e;
-    lv_indev_t *indev = lv_indev_active();
-    lv_point_t p = {0, 0};
-    if (indev) {
-        lv_indev_get_point(indev, &p);
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        if (audio_record_start() == ESP_OK) {
+            ui_set_state(UI_RECORDING);
+            ESP_LOGI(TAG, "pressed -> recording");
+        }
+    } else if (code == LV_EVENT_RELEASED) {
+        size_t n = audio_record_stop();
+        /* 太短（<200ms）不播，避免误触 */
+        if (n > AUDIO_RATE_HZ * 2 / 5) {
+            ESP_LOGI(TAG, "released -> playing back %u bytes", (unsigned)n);
+            ui_set_state(UI_SPEAKING);
+            audio_play(audio_record_data(), n);
+        } else {
+            ESP_LOGI(TAG, "released -> too short (%u bytes), skip", (unsigned)n);
+        }
+        ui_set_state(UI_IDLE);
     }
-    ui_state_t next = (ui_state_t)((s_state + 1) % UI_STATE_COUNT);
-    ESP_LOGI(TAG, "tap at (%d,%d) -> %s", (int)p.x, (int)p.y, k_text[next]);
-    ui_set_state(next);
 }
 
 void app_main(void)
@@ -93,7 +104,8 @@ void app_main(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0xF2F4F8), 0);   /* 浅色背景，深蓝眼睛更清楚 */
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr, on_screen_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_RELEASED, NULL);
 
     s_face = lv_image_create(scr);
     lv_image_set_src(s_face, &bluebot_idle_01);
@@ -113,6 +125,14 @@ void app_main(void)
 
     lv_indev_t *indev = bsp_display_get_input_dev();
     ESP_LOGI(TAG, "U-Face ready (%dx%d), touch indev=%p", BLUEBOT_WIDTH, BLUEBOT_HEIGHT, (void *)indev);
+
+    /* 音频自检：先响一声，确认扬声器通路 */
+    if (audio_init() == ESP_OK) {
+        audio_play_tone(880, 150);
+        ESP_LOGI(TAG, "audio self-test tone played");
+    } else {
+        ESP_LOGE(TAG, "audio_init failed");
+    }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
