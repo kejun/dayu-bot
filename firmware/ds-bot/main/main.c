@@ -29,6 +29,7 @@
 #include "audio.h"
 #include "buttons.h"
 #include "net.h"
+#include "axp2101.h"
 
 static const char *TAG = "ds-bot";
 
@@ -67,6 +68,15 @@ static const char *k_text[] = {
 };
 
 static ui_state_t s_state = UI_IDLE;
+static bool s_screen_on = true;
+
+/* 中间键（PWRON，走 AXP2101）短按：开/关屏幕 */
+static void on_pwrkey(void)
+{
+    s_screen_on = !s_screen_on;
+    bsp_display_brightness_set(s_screen_on ? 100 : 0);
+    ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
+}
 
 /* ---------------------------------------------------------------- UI 更新 */
 static void ui_set_state_locked(ui_state_t st)
@@ -240,6 +250,7 @@ void app_main(void)
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
     bsp_display_start();
+    bsp_display_brightness_set(100);      /* 默认全亮 */
     bsp_display_lock(-1);
 
     lv_obj_t *scr = lv_screen_active();
@@ -274,6 +285,7 @@ void app_main(void)
     s_ptt_q = xQueueCreate(8, sizeof(ptt_evt_t));
     xTaskCreate(ptt_task, "dsbot_ptt", 4096, NULL, 6, NULL);
     buttons_init(on_button);
+    axp2101_init(on_pwrkey);
 
     if (audio_init() == ESP_OK) {
         audio_play_tone(880, 150);
