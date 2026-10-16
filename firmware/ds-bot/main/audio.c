@@ -38,8 +38,22 @@ static void rec_task(void *arg)
     }
     s_rec_len = total;
     s_recording = false;
-    ESP_LOGI(TAG, "recording stop: %u bytes (%.2fs)", (unsigned)total,
-             (double)total / (AUDIO_RATE_HZ * BYTES_PER_SAMPLE));
+
+    /* 诊断：看麦克风到底录到了什么 */
+    const int16_t *p = (const int16_t *)s_buf;
+    size_t c = total / 2;
+    int32_t mx = 0;
+    int64_t sum = 0;
+    for (size_t i = 0; i < c; i++) {
+        int32_t v = p[i];
+        if (v < 0) v = -v;
+        if (v > mx) mx = v;
+        sum += (int64_t)v * v;
+    }
+    int rms = c ? (int)sqrt((double)sum / (double)c) : 0;
+    ESP_LOGI(TAG, "recording stop: %u bytes (%.2fs) peak=%d rms=%d",
+             (unsigned)total, (double)total / (AUDIO_RATE_HZ * BYTES_PER_SAMPLE),
+             (int)mx, rms);
     s_rec_task = NULL;
     vTaskDelete(NULL);
 }
@@ -66,8 +80,8 @@ esp_err_t audio_init(void)
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_spk, &fs));
     ESP_ERROR_CHECK(esp_codec_dev_open(s_mic, &fs));
-    esp_codec_dev_set_out_vol(s_spk, 70);
-    esp_codec_dev_set_in_gain(s_mic, 30.0f);
+    esp_codec_dev_set_out_vol(s_spk, 100);   /* 音量曲线 100 = 0dB（满幅） */
+    esp_codec_dev_set_in_gain(s_mic, 36.0f);
 
     if (!s_buf) {
         s_buf = heap_caps_malloc(MAX_BYTES, MALLOC_CAP_SPIRAM);
@@ -126,17 +140,29 @@ esp_err_t audio_play(const void *data, size_t len)
     if (!s_spk || !data || !len) {
         return ESP_ERR_INVALID_ARG;
     }
-    const uint8_t *p = (const uint8_t *)data;
-    size_t left = len;
-    while (left > 0) {
-        size_t n = left > 4096 ? 4096 : left;
-        int ret = esp_codec_dev_write(s_spk, (void *)p, n);
+    /* 软件增益：硬件已拉满，但源音频（麦克风回放/TTS）电平往往偏低 */
+    const float gain = 2.0f;
+    static int16_t stage[2048];
+    const int16_t *src = (const int16_t *)data;
+    size_t total = len / 2;
+    size_t done = 0;
+    while (done < total) {
+        size_t n = total - done;
+        if (n > sizeof(stage) / sizeof(stage[0])) {
+            n = sizeof(stage) / sizeof(stage[0]);
+        }
+        for (size_t i = 0; i < n; i++) {
+            int32_t v = (int32_t)(src[done + i] * gain);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            stage[i] = (int16_t)v;
+        }
+        int ret = esp_codec_dev_write(s_spk, stage, (int)(n * sizeof(int16_t)));
         if (ret != ESP_CODEC_DEV_OK) {
             ESP_LOGE(TAG, "write failed: %d", ret);
             return ESP_FAIL;
         }
-        p += n;
-        left -= n;
+        done += n;
     }
     return ESP_OK;
 }
@@ -149,7 +175,7 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < n; i++) {
-        tone[i] = (int16_t)(sinf(2.0f * (float)M_PI * freq_hz * i / AUDIO_RATE_HZ) * 8000);
+        tone[i] = (int16_t)(sinf(2.0f * (float)M_PI * freq_hz * i / AUDIO_RATE_HZ) * 12000);
     }
     esp_err_t ret = audio_play(tone, n * sizeof(int16_t));
     free(tone);
