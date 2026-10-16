@@ -17,6 +17,7 @@
 
 #include "bluebot_assets.h"
 #include "bluebot_player.h"
+#include "dsbot_font_32.h"
 
 static const char *TAG = "ds-bot";
 
@@ -80,8 +81,9 @@ void app_main(void)
     lv_obj_set_y(s_face, -28);
 
     s_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_label, &dsbot_font_32, 0);   /* 32px 中文字体 */
     lv_obj_set_style_text_color(s_label, lv_color_hex(0x2B3A55), 0);
-    lv_obj_align(s_label, LV_ALIGN_BOTTOM_MID, 0, -44);
+    lv_obj_align(s_label, LV_ALIGN_BOTTOM_MID, 0, -36);
 
     bluebot_player_bind(&s_pet, s_face, lv_tick_get());
     ui_set_state(UI_IDLE);
