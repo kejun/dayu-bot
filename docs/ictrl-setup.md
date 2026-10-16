@@ -239,3 +239,24 @@ printf 'ls\n' | afcclient --container "$BID" -u "$UDID"     # 验证可访问
 Clash 只监听 `127.0.0.1` 时，可在 Mac 上转发 `0.0.0.0:7893 → 127.0.0.1:7892`
 （见 `~/.dayu/portfwd.py`），再把手机 Wi-Fi 代理设为 `192.168.1.13:7893`。
 （注意：`curl --noproxy '*'` 会覆盖 `-x`，测试时别一起用。）
+
+## 主机侧连不上手机（python/node 报 No route to host）
+
+macOS 的**「本地网络」权限**会拦截 node/python/ruby 等运行时对局域网设备的连接
+（报 `EHOSTUNREACH`），但系统自带的 `curl`/`nc`/`ping` 被豁免。现象：
+同一台机器上 `curl http://<手机>:8200/schema` 返回 200，而 `python3 -c "socket..."` 报
+`[Errno 65] No route to host`。
+
+**处理**：`host/bridge/ictrl.py` 把 iCTRL 官方客户端的 HTTP 层换成 `curl`
+（monkeypatch `_post`），加密逻辑不变；`_get` 也走 curl。这样 bridge 与 Hermes 都能访问手机。
+
+> 根治办法：系统设置 → 隐私与安全性 → **本地网络** → 给终端 App 授权。
+
+## 已跑通的完整链路（2026-10-16）
+
+```
+bridge ask "…"  →  hermes -z  →  iCTRL (:8200)  →  iPhone
+```
+- `bridge doctor` 全 OK（skill=1.98.12）
+- `bridge pair` 成功（`client_name` 不能为 null，否则服务端报 "client_name is required"）
+- `bridge install-skill` 已把 `/skill` 装进 Hermes（`~/.hermes/skills/phone-control/ictrl-phone-control/`）

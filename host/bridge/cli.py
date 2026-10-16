@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -51,8 +52,9 @@ def cmd_doctor(cfg: Config, args) -> int:
 
 def cmd_pair(cfg: Config, args) -> int:
     c = IctrlClient(args.host or cfg.ictrl_host, cfg.ictrl_client)
+    name = args.name or os.uname().nodename
     try:
-        rec = c.pair(args.name, plain=args.plain)
+        rec = c.pair(name, plain=args.plain)
     except IctrlError as e:
         print(f"配对失败：{e}", file=sys.stderr)
         return 1

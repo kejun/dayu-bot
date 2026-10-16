@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import urllib.request
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +28,36 @@ def _load_vendor(path: Path):
     mod = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(mod)
+    # macOS 的「本地网络」权限会拦截 node/python/ruby 等运行时的局域网连接
+    # （报 EHOSTUNREACH），但系统自带的 curl 被豁免。所以把官方客户端的
+    # HTTP 层换成 curl，其余加密逻辑完全不动。
+    mod._post = _curl_post
     return mod
+
+
+def _curl(url: str, *, method: str = "GET", body: bytes | None = None,
+          timeout: float = 30.0) -> tuple[int, str]:
+    """用系统 curl 发一个请求，返回 (状态码, 响应文本)。"""
+    cmd = ["curl", "-sS", "--noproxy", "*", "-m", str(int(timeout)),
+           "-X", method, "-w", "\n%{http_code}", url]
+    if body is not None:
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
+    p = subprocess.run(cmd, input=body, capture_output=True)
+    out = p.stdout.decode("utf-8", "replace")
+    if p.returncode != 0 and not out:
+        raise IctrlError(f"curl 失败({p.returncode}): {p.stderr.decode('utf-8','replace').strip()}")
+    head, _, tail = out.rpartition("\n")
+    code = int(tail) if tail.strip().isdigit() else 0
+    return code, head
+
+
+def _curl_post(url: str, obj: dict, timeout: float) -> tuple[int, dict]:
+    """替代官方客户端的 urllib._post，签名保持一致。"""
+    code, text = _curl(url, method="POST", body=json.dumps(obj).encode(), timeout=timeout)
+    try:
+        return code, json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return code, {"error": {"message": text[:500]}}
 
 
 @dataclass
@@ -108,10 +137,12 @@ class IctrlClient:
     def _get(self, path: str, timeout: float = 15.0) -> str:
         url = f"http://{self.host}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return r.read().decode("utf-8", "replace")
-        except Exception as e:  # noqa: BLE001
+            code, text = _curl(url, timeout=timeout)
+        except IctrlError as e:
             raise IctrlError(f"GET {url} 失败: {e}") from e
+        if code != 200:
+            raise IctrlError(f"GET {url} 返回 {code}")
+        return text
 
     def skill_md(self) -> str:
         return self._get("/skill")
