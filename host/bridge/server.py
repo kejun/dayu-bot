@@ -56,16 +56,21 @@ class Bridge:
     async def _handler(self, ws) -> None:
         # --- 握手认证 ---
         try:
-            hello = P.parse(await asyncio.wait_for(ws.recv(), timeout=10))
-        except Exception:  # noqa: BLE001
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            log.info("first frame: %r", raw[:300] if isinstance(raw, (str, bytes)) else raw)
+            hello = P.parse(raw)
+        except Exception as e:  # noqa: BLE001
+            log.warning("握手失败: %r", e)
             await ws.close()
             return
         if hello.get("t") != P.Msg.HELLO:
+            log.warning("首条消息不是 hello: %r", hello)
             await self._send(ws, P.notice("error", "首条消息必须是 hello"))
             await ws.close()
             return
         if self.cfg.token and not secrets.compare_digest(
                 str(hello.get("token", "")), self.cfg.token):
+            log.warning("认证失败: token 不匹配")
             await self._send(ws, P.notice("error", "认证失败"))
             await ws.close()
             return

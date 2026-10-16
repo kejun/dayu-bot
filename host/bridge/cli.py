@@ -111,7 +111,10 @@ def cmd_install_skill(cfg: Config, args) -> int:
 
 
 def cmd_serve(cfg: Config, args) -> int:
+    import logging
     from .server import Bridge
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout, args=args.hermes_args or [])
     bridge = Bridge(cfg, agent, _client(cfg))
     print(f"网关监听 ws://{cfg.bind}:{cfg.port}  手机={cfg.ictrl_host}")

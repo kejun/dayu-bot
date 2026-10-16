@@ -28,3 +28,4 @@ firmware/*/managed_components/
 firmware/*/sdkconfig
 firmware/*/sdkconfig.old
 firmware/*/dependencies.lock
+firmware/*/sdkconfig.defaults.local

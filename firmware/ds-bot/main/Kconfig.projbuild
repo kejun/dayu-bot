@@ -1,0 +1,25 @@
+menu "ds-bot 配置"
+
+    config DSBOT_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            要连接的 2.4GHz WiFi 名称。手机和主机要在同一网络。
+
+    config DSBOT_WIFI_PASSWORD
+        string "WiFi 密码"
+        default ""
+
+    config DSBOT_BRIDGE_HOST
+        string "主机地址（bridge serve 所在机器）"
+        default "192.168.1.13"
+
+    config DSBOT_BRIDGE_PORT
+        int "主机端口"
+        default 8765
+
+    config DSBOT_BRIDGE_TOKEN
+        string "终端认证 token（与主机的 BRIDGE_TOKEN 一致）"
+        default ""
+
+endmenu
