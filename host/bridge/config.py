@@ -43,7 +43,7 @@ class Config:
 
     # --- Agent (Hermes) ---
     hermes_bin: str = "hermes"
-    agent_timeout: int = 300            # 秒
+    agent_timeout: int = 600            # 秒（手机多步操作较慢）
 
     # --- 语音识别（whisper.cpp，本地免费）---
     stt_binary: str = "whisper-cli"

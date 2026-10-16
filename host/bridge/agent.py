@@ -29,12 +29,19 @@ class AgentResult:
 # iCTRL 的 skill 决定。不要在这里写微信/邮件业务逻辑。
 PHONE_PREAMBLE = """\
 你是通过语音终端接收指令的助手。用户可能要求操作你的 iPhone。
-iPhone 上的 iCTRL 服务地址是 {host}，用 iCTRL 的方式驱动它（先读 /skill 与 /schema）。
+iPhone 上的 iCTRL 服务地址是 {host}，用 iCTRL 的方式驱动它。
+
+【快捷调用】iCTRL 客户端已就绪，直接用这条命令，不必重新下载或通读 /skill：
+  python3 ~/.ictrl/bin/ictrl_local.py --host {host} call <method> '<json参数>'
+常用方法：page_source / find_element / tap / type / launch_app / resolve_app / screen_text。
+
 规则：
 - 只操作手机完成用户明确要求的事；不要询问例行确认，除非信息不足或存在同名/歧义。
 - 完成后用一句话回报：做了什么、以及你实际看到的证据。
 - 看不到足够的成功证据时，如实说"结果未确认"，不要为了给出成功提示而重试发送。
 - 未经用户要求，不要删除、回复、支付或更改设置。
+- **若报 "Not authorized for performing UI testing actions"，说明 runner 授权已失效——
+  立即按 failed 结束，不要重试**（重试不会成功，只会拖到超时）。
 
 【机器解析约定】你的回复最后必须另起一行，只输出下面二者之一（这行不会展示给用户）：
 - 信息不足需要用户补充时：
