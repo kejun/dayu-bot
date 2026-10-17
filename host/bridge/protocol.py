@@ -56,8 +56,8 @@ def result(request_id: str, kind: str, text: str, evidence: dict | None = None) 
                 evidence=evidence or {})
 
 
-def speak(audio_id: int, text: str = "", fmt: str = "pcm_s16le") -> str:
-    return _msg(Msg.SPEAK, audio_id=audio_id, text=text, format=fmt)
+def speak(audio_id: int, text: str = "", fmt: str = "pcm_s16le", nbytes: int = 0) -> str:
+    return _msg(Msg.SPEAK, audio_id=audio_id, text=text, format=fmt, bytes=nbytes)
 
 
 def notice(level: str, text: str) -> str:

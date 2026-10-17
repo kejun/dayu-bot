@@ -181,3 +181,107 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
     free(tone);
     return ret;
 }
+
+/* ==================== 唤醒词：空闲 VAD 采集 ==================== */
+/*
+ * 空闲时读麦克风，按 20ms 帧算 RMS。超过阈值认为有语音，开始收集；
+ * 连续静音 WAKE_SIL_MS 或收集满 WAKE_MAX_MS 就回调一段 PCM 给上层
+ * （上层发给主机做识别，找「小弟」）。
+ */
+#define WAKE_FRAME_MS   20
+#define WAKE_MAX_MS     2500
+#define WAKE_SIL_MS     700
+#define WAKE_RMS_ON     1400      /* 起录阈值 */
+#define WAKE_RMS_OFF    700       /* 静音判定阈值 */
+#define WAKE_FRAME_BYTES (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_FRAME_MS / 1000)
+#define WAKE_MAX_BYTES   (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_MAX_MS / 1000)
+
+static audio_clip_cb_t s_clip_cb;
+static volatile bool   s_wake_paused = true;
+static uint8_t *s_wake_buf;
+
+static int frame_rms(const int16_t *p, size_t n)
+{
+    int64_t sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        sum += (int64_t)p[i] * p[i];
+    }
+    return n ? (int)sqrt((double)sum / (double)n) : 0;
+}
+
+static void wake_task(void *arg)
+{
+    (void)arg;
+    const size_t fbytes = WAKE_FRAME_BYTES;
+    int16_t frame[WAKE_FRAME_BYTES / 2];
+    size_t total = 0;
+    int silence_ms = 0;
+    bool collecting = false;
+
+    while (1) {
+        if (s_wake_paused || !s_wake_buf) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            collecting = false;
+            continue;
+        }
+        int ret = esp_codec_dev_read(s_mic, frame, fbytes);
+        if (ret != ESP_CODEC_DEV_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        int rms = frame_rms(frame, fbytes / 2);
+
+        if (!collecting) {
+            if (rms > WAKE_RMS_ON) {
+                collecting = true;
+                total = 0;
+                silence_ms = 0;
+                ESP_LOGI(TAG, "wake: 检测到语音 (rms=%d)", rms);
+            } else {
+                continue;
+            }
+        }
+        /* 收集 */
+        if (total + fbytes <= WAKE_MAX_BYTES) {
+            memcpy(s_wake_buf + total, frame, fbytes);
+            total += fbytes;
+        }
+        silence_ms = (rms < WAKE_RMS_OFF) ? (silence_ms + WAKE_FRAME_MS) : 0;
+
+        if (silence_ms >= WAKE_SIL_MS || total + fbytes > WAKE_MAX_BYTES) {
+            collecting = false;
+            if (total > (size_t)(AUDIO_RATE_HZ * BYTES_PER_SAMPLE / 2)) {   /* >0.5s */
+                ESP_LOGI(TAG, "wake: 片段 %u 字节", (unsigned)total);
+                if (s_clip_cb) {
+                    s_clip_cb(s_wake_buf, total);
+                }
+            }
+            total = 0;
+        }
+    }
+}
+
+esp_err_t audio_wake_start(audio_clip_cb_t cb)
+{
+    if (!s_mic) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_clip_cb = cb;
+    if (!s_wake_buf) {
+        s_wake_buf = heap_caps_malloc(WAKE_MAX_BYTES, MALLOC_CAP_SPIRAM);
+        if (!s_wake_buf) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_wake_paused = false;
+    if (xTaskCreate(wake_task, "dsbot_wake", 4096, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "wake: 空闲 VAD 监听已启动 (阈值 rms>%d)", WAKE_RMS_ON);
+    return ESP_OK;
+}
+
+void audio_wake_pause(bool pause)
+{
+    s_wake_paused = pause;
+}

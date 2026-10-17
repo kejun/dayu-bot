@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 import uuid
 from typing import Awaitable, Callable
 
@@ -35,15 +36,19 @@ class Bridge:
         ictrl: IctrlClient,
         stt: SttFn | None = None,
         tts: TtsFn | None = None,
+        say: object | None = None,
     ):
         self.cfg = cfg
         self.agent = agent
         self.ictrl = ictrl
         self.stt = stt
         self.tts = tts
+        self.say = say            # bridge.tts.SayTts（本地 TTS）
         self.tasks = TaskManager(self._runner, notify=self._on_task)
         self._clients: dict[object, dict] = {}
         self._speak_id = 0
+        self._awake_until = 0.0          # 唤醒词命中后的「醒着」窗口
+        self._wake_buf: dict[str, bytearray] = {}
 
     # ---------------------------------------------------------------- server
     async def serve_forever(self) -> None:
@@ -134,6 +139,7 @@ class Bridge:
 
         elif t == P.Msg.AUDIO_END:
             rid = msg["request_id"]
+            mode = msg.get("mode", "task")
             data = bytes(state["audio"])
             state["audio"] = bytearray()
             state["request_id"] = None
@@ -142,6 +148,9 @@ class Bridge:
                 return
             if self.stt is None:
                 await self._send(ws, P.notice("warn", "主机未配置语音识别（STT）"))
+                return
+            if mode == "wake":
+                await self._on_wake_clip(rid, data)
                 return
             await self._send(ws, P.status(rid, State.PROCESSING.value))
             log.info("STT: %d 字节音频 …", len(data))
@@ -176,6 +185,9 @@ class Bridge:
             data = P.result(task.request_id, task.result_kind.value
                             if task.result_kind else "unknown",
                             task.result_text or "", task.evidence)
+            # 结果也念出来（PRD §5.1：结果支持语音播报）
+            if task.result_text:
+                asyncio.create_task(self._speak_all(task.result_text))
         else:
             data = P.status(task.request_id, task.state.value)
         self._broadcast(data)
@@ -212,3 +224,60 @@ class Bridge:
     def _broadcast(self, data: str) -> None:
         for ws in list(self._clients):
             asyncio.create_task(self._send(ws, data))
+
+    # ------------------------------------------------------------- 唤醒词
+    WAKEWORD = "小弟"
+    AWAKE_SECONDS = 20.0
+
+    async def _on_wake_clip(self, rid: str, data: bytes) -> None:
+        """处理一段空闲片段：识别 → 找唤醒词 → 应答 / 提交指令。"""
+        try:
+            text = (await self.stt(data, self.cfg.audio().as_dict())).strip()
+        except Exception as e:  # noqa: BLE001
+            log.warning("唤醒片段识别失败: %r", e)
+            return
+        if not text:
+            return
+        log.info("唤醒片段: %r", text)
+        now = time.time()
+        hit = self.WAKEWORD in text
+
+        if hit:
+            self._awake_until = now + self.AWAKE_SECONDS
+            cmd = text.replace(self.WAKEWORD, "").strip("，。,.、 ！!？?")
+            log.info("🔔 唤醒词命中（剩余指令: %r）", cmd)
+            await self._speak_all("有什么事儿，我在听")
+            if len(cmd) >= 2:
+                self.tasks.submit(f"{rid}-cmd", cmd, source="voice")
+            return
+
+        if now < self._awake_until and len(text) >= 2:
+            self._awake_until = now + self.AWAKE_SECONDS
+            log.info("（醒着）当作指令提交: %r", text)
+            self.tasks.submit(f"{rid}-cmd", text, source="voice")
+        else:
+            log.info("未唤醒，忽略: %r", text)
+
+    # ---------------------------------------------------------------- TTS
+    async def _speak_all(self, text: str) -> None:
+        """把一段话合成音频发给所有终端（speak + 二进制帧）。"""
+        if not self.say or not text.strip():
+            return
+        try:
+            pcm = await self.say.synthesize(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("TTS 合成失败: %r", e)
+            return
+        if not pcm:
+            return
+        self._speak_id += 1
+        head = P.speak(self._speak_id, text, nbytes=len(pcm))
+        for ws in list(self._clients):
+            await self._send(ws, head)
+            for off in range(0, len(pcm), 4096):
+                try:
+                    await ws.send(pcm[off:off + 4096])
+                except Exception:  # noqa: BLE001
+                    self._clients.pop(ws, None)
+                    break
+        log.info("已播报: %r (%d 字节)", text, len(pcm))

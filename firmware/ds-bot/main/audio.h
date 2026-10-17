@@ -33,6 +33,15 @@ esp_err_t audio_play(const void *data, size_t len);
 /* 播放一段固定频率的正弦音（自检用，不需要麦克风） */
 esp_err_t audio_play_tone(int freq_hz, int ms);
 
+/* ---- 唤醒词：空闲时做 VAD 采集 ---- */
+/* 检出一段有语音的片段时回调（在采集任务上下文，**不要阻塞太久**） */
+typedef void (*audio_clip_cb_t)(const void *pcm, size_t len);
+
+/* 启动空闲监听（VAD） */
+esp_err_t audio_wake_start(audio_clip_cb_t cb);
+/* 暂停/恢复（录音、播报时要暂停，避免抢麦克风） */
+void audio_wake_pause(bool pause);
+
 #ifdef __cplusplus
 }
 #endif

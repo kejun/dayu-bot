@@ -164,6 +164,7 @@ static void ptt_task(void *arg)
             continue;
         }
         if (e == PTT_PRESS) {
+            audio_wake_pause(true);              /* 录音时暂停空闲监听 */
             snprintf(rid, sizeof(rid), "r%u", ++s_req_seq);
             if (audio_record_start() == ESP_OK) {
                 ui_set_state_locked(UI_RECORDING);
@@ -211,21 +212,66 @@ static void ptt_task(void *arg)
                 }
                 ui_set_state_locked(UI_IDLE);
             }
+            audio_wake_pause(false);             /* 恢复空闲监听 */
         }
     }
 }
 
-/* -------------------------------------------------------------- 事件源 */
-static void on_screen_event(lv_event_t *e)
+/* ---- 唤醒词：空闲片段上传主机 ---- */
+static uint32_t s_wake_seq;
+
+static void on_wake_clip(const void *pcm, size_t len)
 {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED) {
-        ptt_post(PTT_PRESS);
-    } else if (code == LV_EVENT_RELEASED) {
-        ptt_post(PTT_RELEASE);
+    if (!net_connected()) {
+        return;
+    }
+    char rid[24], msg[160];
+    snprintf(rid, sizeof(rid), "w%u", ++s_wake_seq);
+    snprintf(msg, sizeof(msg),
+             "{\"v\":\"1\",\"t\":\"audio_start\",\"request_id\":\"%s\",\"mode\":\"wake\"}", rid);
+    net_send_json(msg);
+    const uint8_t *p = (const uint8_t *)pcm;
+    for (size_t off = 0; off < len; off += 4096) {
+        size_t n = (len - off) > 4096 ? 4096 : (len - off);
+        net_send_binary(p + off, n);
+    }
+    snprintf(msg, sizeof(msg),
+             "{\"v\":\"1\",\"t\":\"audio_end\",\"request_id\":\"%s\",\"mode\":\"wake\","
+             "\"duration_ms\":%u}", rid, (unsigned)(len * 1000 / (AUDIO_RATE_HZ * 2)));
+    net_send_json(msg);
+}
+
+/* ---- 主机语音（TTS）播放 ---- */
+typedef struct { uint8_t *pcm; size_t len; } tts_item_t;
+static QueueHandle_t s_tts_q;
+
+static void on_tts_audio(uint8_t *pcm, size_t len)   /* WS 任务上下文 */
+{
+    tts_item_t it = { pcm, len };
+    if (!s_tts_q || xQueueSend(s_tts_q, &it, 0) != pdTRUE) {
+        free(pcm);                                   /* 队列满则丢弃 */
     }
 }
 
+static void tts_task(void *arg)
+{
+    (void)arg;
+    tts_item_t it;
+    while (1) {
+        if (xQueueReceive(s_tts_q, &it, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        ESP_LOGI(TAG, "播放主机语音 %u 字节", (unsigned)it.len);
+        audio_wake_pause(true);
+        ui_set_state_locked(UI_SPEAKING);
+        audio_play(it.pcm, it.len);
+        free(it.pcm);
+        ui_set_state_locked(UI_IDLE);
+        audio_wake_pause(false);
+    }
+}
+
+/* ------------------------------------------- 事件源：只有物理键 */
 static void on_button(int gpio, bool pressed)
 {
     ESP_LOGI(TAG, "button GPIO%d %s", gpio, pressed ? "down" : "up");
@@ -260,9 +306,7 @@ void app_main(void)
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0xF2F4F8), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_RELEASED, NULL);
+    /* 屏幕不再触发录音：只保留物理键 + 语音唤醒（用户要求） */
 
     s_net_label = lv_label_create(scr);
     lv_obj_set_style_text_color(s_net_label, lv_color_hex(0x8894A8), 0);
@@ -288,6 +332,11 @@ void app_main(void)
 
     s_ptt_q = xQueueCreate(8, sizeof(ptt_evt_t));
     xTaskCreate(ptt_task, "dsbot_ptt", 4096, NULL, 6, NULL);
+
+    s_tts_q = xQueueCreate(4, sizeof(tts_item_t));
+    xTaskCreate(tts_task, "dsbot_tts", 4096, NULL, 6, NULL);
+    net_set_tts_cb(on_tts_audio);
+    audio_wake_start(on_wake_clip);
     buttons_init(on_button);
     axp2101_init(on_pwrkey);
 

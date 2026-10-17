@@ -18,6 +18,11 @@ extern "C" {
 /* 收到主机消息时的回调（在 WebSocket 任务上下文，不要直接调 LVGL） */
 typedef void (*net_msg_cb_t)(const char *type, const char *json);
 
+/* 收到一整段主机语音（TTS）时回调；**回调负责释放 pcm** */
+typedef void (*net_tts_cb_t)(uint8_t *pcm, size_t len);
+
+void net_set_tts_cb(net_tts_cb_t cb);
+
 esp_err_t net_start(net_msg_cb_t cb);
 bool      net_connected(void);
 

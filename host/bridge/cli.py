@@ -128,7 +128,12 @@ def cmd_serve(cfg: Config, args) -> int:
     stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
     ok, why = stt.available()
     print(f"语音识别: {'OK' if ok else '不可用'} — {why}")
-    bridge = Bridge(cfg, agent, _client(cfg), stt=stt if ok else None)
+    from .tts import SayTts
+    say = SayTts()
+    tok_, twhy = say.available()
+    print(f"语音合成: {'OK' if tok_ else '不可用'} — {twhy}")
+    bridge = Bridge(cfg, agent, _client(cfg), stt=stt if ok else None,
+                    say=say if tok_ else None)
     print(f"网关监听 ws://{cfg.bind}:{cfg.port}  手机={cfg.ictrl_host}")
     try:
         asyncio.run(bridge.serve_forever())

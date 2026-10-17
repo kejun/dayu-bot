@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_websocket_client.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "ds-bot-net";
@@ -21,7 +22,18 @@ static EventGroupHandle_t s_wifi_eg;
 static int  s_retry;
 static esp_websocket_client_handle_t s_ws;
 static net_msg_cb_t s_msg_cb;
+static net_tts_cb_t s_tts_cb;
 static volatile bool s_ws_up;
+
+/* 主机 TTS 音频接收缓冲（PSRAM） */
+static uint8_t *s_tts_buf;
+static size_t   s_tts_need;
+static size_t   s_tts_got;
+
+void net_set_tts_cb(net_tts_cb_t cb)
+{
+    s_tts_cb = cb;
+}
 
 /* ------------------------------------------------------------------ WiFi */
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -97,9 +109,28 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "websocket disconnected");
         s_ws_up = false;
+        if (s_tts_buf) { free(s_tts_buf); s_tts_buf = NULL; s_tts_need = s_tts_got = 0; }
         break;
     case WEBSOCKET_EVENT_DATA:
         if (d->op_code == 0x08) {           /* close */
+            break;
+        }
+        if (d->op_code == 0x02) {           /* binary: 主机 TTS 音频 */
+            if (s_tts_buf && s_tts_got + d->data_len <= s_tts_need) {
+                memcpy(s_tts_buf + s_tts_got, d->data_ptr, d->data_len);
+                s_tts_got += d->data_len;
+                if (s_tts_got >= s_tts_need) {
+                    uint8_t *pcm = s_tts_buf;
+                    size_t len = s_tts_got;
+                    s_tts_buf = NULL; s_tts_need = s_tts_got = 0;
+                    ESP_LOGI(TAG, "TTS 音频完整: %u 字节", (unsigned)len);
+                    if (s_tts_cb) {
+                        s_tts_cb(pcm, len);      /* 回调负责 free */
+                    } else {
+                        free(pcm);
+                    }
+                }
+            }
             break;
         }
         if (d->op_code == 0x01 && d->data_len > 0) {   /* text */
@@ -115,6 +146,17 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                         cJSON *t = cJSON_GetObjectItem(root, "t");
                         if (cJSON_IsString(t)) {
                             type = t->valuestring;
+                        }
+                        /* speak: 预留接收缓冲，等二进制帧填满后播放 */
+                        if (!strcmp(type, "speak")) {
+                            cJSON *bytes = cJSON_GetObjectItem(root, "bytes");
+                            if (cJSON_IsNumber(bytes) && bytes->valueint > 0) {
+                                if (s_tts_buf) { free(s_tts_buf); }
+                                s_tts_need = (size_t)bytes->valueint;
+                                s_tts_got = 0;
+                                s_tts_buf = heap_caps_malloc(s_tts_need, MALLOC_CAP_SPIRAM);
+                                ESP_LOGI(TAG, "准备接收 TTS 音频 %u 字节", (unsigned)s_tts_need);
+                            }
                         }
                     }
                     ESP_LOGI(TAG, "rx: %s", buf);
