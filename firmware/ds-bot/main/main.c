@@ -336,13 +336,13 @@ void app_main(void)
     s_tts_q = xQueueCreate(4, sizeof(tts_item_t));
     xTaskCreate(tts_task, "dsbot_tts", 4096, NULL, 6, NULL);
     net_set_tts_cb(on_tts_audio);
-    audio_wake_start(on_wake_clip);
     buttons_init(on_button);
     axp2101_init(on_pwrkey);
 
     if (audio_init() == ESP_OK) {
         audio_play_tone(880, 150);
         ESP_LOGI(TAG, "audio self-test tone played");
+        audio_wake_start(on_wake_clip);          /* 必须在 audio_init 之后 */
     } else {
         ESP_LOGE(TAG, "audio_init failed");
     }
