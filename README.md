@@ -24,6 +24,7 @@ Agent 用 **iCTRL** 操作 iPhone，结果回到 ESP32 显示/播报。
 | 路径 | 内容 |
 |---|---|
 | `docs/` | 架构、开发计划、协议、iCTRL 安装、验收用例 |
+| **`docs/PROJECT-SUMMARY.md`** | **项目总结与踩坑记录（先读这个）** |
 | `host/` | 主机连接程序（Python）：iCTRL 客户端封装、Agent 调用、任务串行、ESP32 网关 |
 | `firmware/` | ESP32-S3 固件（Waveshare ESP32-S3-Touch-AMOLED-2.16） |
 
