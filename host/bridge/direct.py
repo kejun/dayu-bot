@@ -14,7 +14,7 @@ import httpx
 from .agent import AgentError, AgentResult
 from .config import Config, PROJECT_DIR
 from .intent import PLAN_SYSTEM, PLAN_TOOL, TaskPlan, fast_plan
-from .phone_tools import AsyncPhone, PhoneError, PhoneTools, TOOLS, validate_call
+from .phone_tools import AsyncPhone, PhoneError, PhoneTools, UnconfirmedPhoneAction, TOOLS, validate_call
 from .processes import ProcessCleanupError, _complete_despite_cancellation
 from .qwen import QwenSettings
 
@@ -30,6 +30,15 @@ SYSTEM = """你是手机语音助手，只完成用户明确要求的任务。�
 - success要求完成整个任务目标，不能仅打开应用就宣称选购成功；未决偏好影响商品选择时，先展示实际候选并追问。
 - 先读当前页面再操作；按实际可见文字用 find_element 找到 ref 后 tap。不要凭记忆点击，坐标仅在 OCR 后使用。
 - 一次只调用一个工具。成功动作不重复；报超时/结果未确认时不重试发送或点击。
+- action_completed=true 表示刚才点击/输入已完成，screen 是动作后的新页面；不要重复刚才的 ref。旧 ref 失效后按新页面重新定位。
+- 查找元素必须使用页面实际的控件类型；搜索占位文字可能是 StaticText，真正输入区域可能是 TextView，不凭“搜索”二字猜 SearchField。
+- 当前树确有无标签 TextView/TextField 时，用 find_element(text='', element_type=实际类型) 获取唯一输入框 ref，再 tap 聚焦；不能把空 text 发成任意搜索，也不能只点占位文字后就认为已聚焦。
+- 明确 element_not_found 是未点击的查找未匹配，可按当前页面修正类型/标签或用 OCR；未知动作结果不重放。
+- accessibility_unavailable 表示只读控件查找已结束、未点击。下一步 read_screen(mode="ocr")，按新画面的文字框定位，不反复查找控件或重新打开应用。
+- 工具报错先分析原因，再读屏/OCR或 diagnose_phone；连续没有进展时，用 replan_task（若有该工具）重新制定剩余步骤。保留用户目标、数量和限制，不重做成功的动作，不轻易用失败结束。
+- 手机动作暂未确认时，优先 reconcile_action（若有该工具）查询同一动作的完成回执；核实后继续剩余目标。暂时无法确认时保留原任务等待恢复，不重放、不声称成功。
+- 已有联系人发消息走应用内搜索/通讯录，不能拿“添加朋友”代替查找现有联系人；找不到搜索入口先读屏或 OCR。
+- 收件人同音字不能猜：没有精确匹配但出现近似姓名时先问用户确认，未确定前不发送。
 - 精简界面不足时用 screen_details 读完整快照；树稀疏或 channel 推荐 OCR 时 read_screen(mode=ocr)。不要把省略当成不存在。
 - compact_truncated=false 时已保留全部可读文字和交互节点，普通读屏任务直接报告主要页面即可，不遍历布局容器或重复请求完整快照。
 - 不加固定等待。界面明确仍在加载时才再读，避免无进展循环。
@@ -49,6 +58,8 @@ class Conversation:
     original: str = ""
     answers: list[str] = field(default_factory=list)
     plan: TaskPlan | None = None
+    memory: dict | None = None
+    execution_context: dict | None = None
 
 
 class DirectAgent:
@@ -158,6 +169,8 @@ class DirectAgent:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.settings.request_timeout, connect=5))
         messages = ([{"role": "system", "content": PLAN_SYSTEM}, {"role": "user", "content": json.dumps({
             "original": context.original, "answers": context.answers,
+            **({"memory": context.memory} if context.memory else {}),
+            **({"execution_context": context.execution_context} if context.execution_context else {}),
             **({"format_repair": repair,
                 "instruction": "上次计划未通过校验。只修正格式或违反原指令的入口；保留原目标和限制，按 prepare_task schema 返回完整规范。"}
                if repair else {})}, ensure_ascii=False)}]
@@ -201,7 +214,8 @@ class DirectAgent:
         log.info("qwen_model phase=%s step=%d elapsed_ms=%d", "plan" if planning else "execute", step, elapsed)
         return message
 
-    async def normalize(self, text: str, answers: list[str] | None = None) -> dict:
+    async def normalize(self, text: str, answers: list[str] | None = None, *, memory: dict | None = None,
+                        execution_context: dict | None = None) -> dict:
         """Inspect a plan using the same production normalizer; never call iCTRL."""
         ok, why = self.available()
         if not ok:
@@ -209,6 +223,8 @@ class DirectAgent:
         context = Conversation(PhoneTools(self.cfg, self.phone, asyncio.Event(),
                                          self.trace_root / uuid.uuid4().hex), [],
                                original=text, answers=answers or [])
+        context.memory = memory
+        context.execution_context = execution_context
         await self._prepare(context)
         return {"trace_id": context.tools.trace_dir.name, "plan": context.plan.as_dict()}
 
@@ -216,7 +232,7 @@ class DirectAgent:
         tools = context.tools
         tools.checkpoint()
         tools.audit("task_input", original=context.original, answers=context.answers)
-        plan = fast_plan(context.original, context.answers)
+        plan = None if context.execution_context else fast_plan(context.original, context.answers)
         source = "fast" if plan else "qwen"
         if plan is None:
             deadline = time.monotonic() + min(self.cfg.qwen_plan_timeout, self.settings.request_timeout)
@@ -323,6 +339,10 @@ class DirectAgent:
                             evidence_id = f"e{len(tools.receipts) + 1}"
                             output = {"ok": value.get("ok", True), "evidence_id": evidence_id,
                                       "mutation_generation": tools.mutation_count, "result": value}
+                        except UnconfirmedPhoneAction as exc:
+                            # The explicit legacy backend has no durable
+                            # operation reconciliation; preserve its old guard.
+                            raise ProcessCleanupError(str(exc)) from exc
                         except PhoneError as exc:
                             if exc.uncertain:
                                 kind = "unknown" if tools.mutation_count else "failed"
@@ -335,7 +355,14 @@ class DirectAgent:
                                               "reason": exc.reason})
                             if "no token" in str(exc) or "rpc failed (401)" in str(exc):
                                 return AgentResult("DONE: failed; 手机配对已失效，请重新配对")
-                            output = {"ok": False, "error": str(exc)[:500]}
+                            if exc.reason == "app_lookup_failed":
+                                kind = "unknown" if tools.mutation_count else "failed"
+                                return AgentResult(f"DONE: {kind}; 查询应用失败，请检查手机连接后重试。")
+                            if exc.reason == 'accessibility_unavailable':
+                                output = {"ok": False, "reason": exc.reason,
+                                          "hint": '只读查找已结束，未点击。请用 read_screen(mode="ocr") 读取当前画面并按文字框定位，不重复查找控件或已成功的动作。'}
+                            else:
+                                output = {"ok": False, "error": str(exc)[:500]}
                             if "Not authorized for performing UI testing actions" in str(exc):
                                 return AgentResult("DONE: failed; 手机 Runner 授权失效，请恢复 Runner 后再试")
                         except (ValueError, TypeError) as exc:

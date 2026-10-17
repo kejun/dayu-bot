@@ -322,7 +322,29 @@ class CancelTests(unittest.IsolatedAsyncioTestCase):
         task = self.bridge.tasks.submit('coffee', '订杯咖啡', owner='test')
         await settle()
         self.assertEqual(task.state, State.NEED_USER)
-        self.assertEqual(spoken, ['附近有美式和拿铁，想选哪一种？'])
+        self.assertEqual(spoken, ['我已经收到了', '附近有美式和拿铁，想选哪一种？'])
+
+    async def test_receipt_waits_for_complete_asr_then_uses_cached_audio_before_execution_finishes(self):
+        synthesized=[]
+        class Say:
+            async def synthesize(self, text):
+                synthesized.append(text);return b'\0'*3200
+        self.bridge.say=Say()
+        await self.bridge._receipt_audio()
+        entered,release=asyncio.Event(),asyncio.Event()
+        async def stt(data,fmt):
+            entered.set();await release.wait();return '打开微信，然后整理公众号推荐文章，滚动五屏。'
+        self.bridge.stt=stt;self.bridge.tasks.start()
+        await self.clip('complete-command');await entered.wait()
+        self.assertFalse(any(isinstance(m,dict) and m.get('t')=='speak' for m in self.ws.sent))
+        release.set();await settle()
+        task=self.bridge.tasks.get('complete-command')
+        self.assertEqual(task.text,'打开微信，然后整理公众号推荐文章，滚动五屏。')
+        self.assertNotEqual(task.state,State.DONE)
+        self.bridge._on_task(task);await settle()
+        spoken=[m['text'] for m in self.ws.sent if isinstance(m,dict) and m.get('t')=='speak']
+        self.assertEqual(spoken,['我已经收到了'])
+        self.assertEqual(synthesized,['我已经收到了'])
 
     async def test_pending_stt_cancel_waits_and_never_submits_late_text(self):
         started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -432,6 +454,68 @@ class CancelTests(unittest.IsolatedAsyncioTestCase):
         await settle()
         self.assertEqual(len(self.bridge.tasks.snapshot()), 1)
 
+    async def test_awake_window_is_consumed_by_one_complete_command(self):
+        self.state['awake_until'] = float('inf')
+        phrases = iter(['打开微信，然后搜索联系人，不发送消息。', '嗯。'])
+        async def stt(data, fmt):return next(phrases)
+        self.bridge.stt = stt
+        await self.clip('command', 'wake');await settle()
+        task = self.bridge.tasks.get('command-cmd')
+        self.assertIsNotNone(task)
+        self.bridge.tasks.cancel(task.request_id)
+        await self.clip('ambient', 'wake');await settle()
+        self.assertEqual(len(self.bridge.tasks.snapshot()), 1)
+
+    async def test_filler_without_answer_target_does_not_start_task(self):
+        self.state['awake_until'] = float('inf')
+        async def stt(data, fmt):return '嗯。'
+        self.bridge.stt = stt
+        await self.clip('filler', 'wake');await settle()
+        self.assertEqual(self.bridge.tasks.snapshot(), [])
+
+    async def test_truncated_audio_is_never_transcribed_or_dispatched(self):
+        async def stt(data, fmt):raise AssertionError('partial audio reached ASR')
+        self.bridge.stt = stt
+        await self.bridge._on_control(self.ws, self.state, P._msg('audio_start', request_id='cut', mode='task', truncated=True))
+        self.bridge._on_audio(self.state, b'\0'*3200)
+        await self.bridge._on_control(self.ws, self.state, P._msg('audio_end', request_id='cut'))
+        await settle()
+        self.assertEqual(self.bridge.tasks.snapshot(), [])
+        self.assertEqual(self.results('cut')[0]['kind'], 'failed')
+
+    async def test_capped_background_speech_never_wakes_or_submits_a_task(self):
+        async def stt(data, fmt):return '大家继续聊天，这不是设备指令。'
+        self.bridge.stt = stt
+        await self.bridge._on_wake_clip(self.ws, self.state, 'ambient-cut', b'', (), 0, truncated=True)
+        self.assertEqual(self.bridge.tasks.snapshot(), [])
+        self.assertEqual(self.ws.sent, [])
+
+    async def test_truncated_wake_command_requests_retry_without_running_its_head(self):
+        async def stt(data, fmt):return '小D小D打开微信然后给'
+        self.bridge.stt = stt
+        await self.bridge._on_wake_clip(self.ws, self.state, 'wake-cut', b'', (), 0, truncated=True)
+        await settle()
+        self.assertEqual(self.bridge.tasks.snapshot(), [])
+        self.assertEqual(self.results('wake-cut')[0]['kind'], 'failed')
+
+    async def test_long_command_uses_bound_wake_ticket_and_cannot_be_reused(self):
+        self.state.update(awake_until=0, command_session=7)
+        async def stt(data, fmt):return '打开股票，然后读取当前页面，不做交易。'
+        self.bridge.stt = stt
+        await self.bridge._on_wake_clip(self.ws, self.state, 'long', b'', (), 0, command_clip=True, command_session=7)
+        task = self.bridge.tasks.get('long-cmd')
+        self.assertEqual(task.text, '打开股票，然后读取当前页面，不做交易。')
+        self.bridge.tasks.cancel(task.request_id)
+        await self.bridge._on_wake_clip(self.ws, self.state, 'late', b'', (), 0, command_clip=True, command_session=7)
+        self.assertEqual(len(self.bridge.tasks.snapshot()), 1)
+
+    async def test_unarmed_command_clip_never_dispatches_phone_task(self):
+        async def stt(data, fmt):return '打开微信'
+        self.bridge.stt = stt
+        await self.bridge._on_wake_clip(self.ws, self.state, 'unarmed', b'', (), 0, command_clip=True)
+        self.assertEqual(self.bridge.tasks.snapshot(), [])
+        self.assertEqual(self.results('unarmed')[0]['kind'], 'failed')
+
     async def test_repeated_cancel_replays_receipt_without_repeating_speech(self):
         spoken = []
         self.bridge._queue_speech = lambda text, **kw: spoken.append(text)
@@ -444,7 +528,7 @@ class CancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(other.cancel_requested)
         self.assertEqual(len(self.results("r1")), 2)  # 重传原回执，便于丢包后恢复设备状态
         self.assertTrue(all(m["kind"] == "cancelled" for m in self.results("r1")))
-        self.assertEqual(len(spoken), 1)
+        self.assertEqual(len([text for text in spoken if text != '我已经收到了']), 1)
 
     async def test_late_tts_is_discarded_after_cancel(self):
         entered, release = asyncio.Event(), asyncio.Event()

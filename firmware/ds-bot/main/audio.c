@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "vad_policy.h"
 
 #include <string.h>
 #include <math.h>
@@ -21,6 +22,7 @@ static esp_codec_dev_handle_t s_mic;
 
 static uint8_t *s_buf;              /* PSRAM 录音缓冲 */
 static atomic_bool s_recording;
+static atomic_bool s_record_truncated;
 static volatile size_t s_rec_len;
 static TaskHandle_t s_rec_task;
 static SemaphoreHandle_t s_mic_lock;
@@ -45,6 +47,7 @@ static void rec_task(void *arg)
         }
     }
     s_rec_len = total;
+    s_record_truncated = (total + chunk) > MAX_BYTES;
     s_recording = false;
     xSemaphoreGive(s_mic_lock);
 
@@ -96,7 +99,7 @@ esp_err_t audio_init(void)
     ESP_ERROR_CHECK(esp_codec_dev_open(s_spk, &fs));
     ESP_ERROR_CHECK(esp_codec_dev_open(s_mic, &fs));
     esp_codec_dev_set_out_vol(s_spk, 100);   /* 音量曲线 100 = 0dB（满幅） */
-    esp_codec_dev_set_in_gain(s_mic, 30.0f);
+    ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(s_mic, 34.5f));
 
     if (!s_buf) {
         s_buf = heap_caps_malloc(MAX_BYTES, MALLOC_CAP_SPIRAM);
@@ -242,17 +245,27 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
  * （上层发给主机做识别，找「小弟」）。
  */
 #define WAKE_FRAME_MS   20
-#define WAKE_MAX_MS     5000      /* 容纳完整“小D小D，取消任务”，避免慢速口令被截成半句 */
-#define WAKE_SIL_MS     900
-#define WAKE_RMS_ON     1200      /* 起录阈值 */
-#define WAKE_RMS_OFF    600       /* 静音判定阈值 */
+#define WAKE_MAX_MS     VAD_UTTERANCE_MAX_MS
+#define WAKE_RMS_ON     VAD_RMS_ON
+#define WAKE_RMS_OFF    VAD_RMS_OFF
 #define WAKE_FRAME_BYTES (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_FRAME_MS / 1000)
 #define WAKE_MAX_BYTES   (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_MAX_MS / 1000)
+#define WAKE_PRE_FRAMES  10       /* 200ms pre-roll preserves a soft word onset */
+static uint8_t s_pre_roll[WAKE_PRE_FRAMES][WAKE_FRAME_BYTES];
 
 static audio_clip_cb_t s_clip_cb;
 static atomic_bool s_wake_paused = true;
 static atomic_uint s_wake_generation;
 static uint8_t *s_wake_buf;
+static atomic_uint s_listen_mode, s_command_deadline;
+
+void audio_listen_mode(audio_listen_mode_t mode)
+{
+    if (mode == AUDIO_COMMAND) atomic_store(&s_command_deadline, xTaskGetTickCount() + pdMS_TO_TICKS(20000));
+    if (atomic_exchange(&s_listen_mode, mode) != (unsigned)mode) atomic_fetch_add(&s_wake_generation, 1);
+}
+
+bool audio_record_truncated(void) { return atomic_load(&s_record_truncated); }
 
 static int frame_rms(const int16_t *p, size_t n)
 {
@@ -271,20 +284,25 @@ static void wake_task(void *arg)
     size_t total = 0;
     int silence_ms = 0;
     bool collecting = false;
+    bool utterance = false;
+    audio_listen_mode_t capture_mode = AUDIO_MONITOR;
     int max_rms = 0;            /* 诊断：每秒打印最大 RMS，便于标定阈值 */
     int diag_ms = 0;
     uint32_t generation = atomic_load(&s_wake_generation);
+    unsigned speech_frames = 0, pre_pos = 0, pre_count = 0;
 
     while (1) {
         if (s_recording || !s_wake_buf) {
             vTaskDelay(pdMS_TO_TICKS(50));
             collecting = false;
+            speech_frames = pre_count = 0;
             continue;
         }
         xSemaphoreTake(s_mic_lock, portMAX_DELAY);
         if (s_recording) {
             xSemaphoreGive(s_mic_lock);
             collecting = false;
+            speech_frames = pre_count = 0;
             continue;
         }
         int ret = esp_codec_dev_read(s_mic, frame, fbytes);
@@ -294,6 +312,7 @@ static void wake_task(void *arg)
             generation != atomic_load(&s_wake_generation)) {
             generation = atomic_load(&s_wake_generation);
             collecting = false;
+            speech_frames = pre_count = 0;
             continue;
         }
         if (ret != ESP_CODEC_DEV_OK) {
@@ -308,11 +327,28 @@ static void wake_task(void *arg)
         }
 
         if (!collecting) {
-            if (rms > WAKE_RMS_ON) {
+            memcpy(s_pre_roll[pre_pos], frame, fbytes);
+            pre_pos = (pre_pos + 1) % WAKE_PRE_FRAMES;
+            if (pre_count < WAKE_PRE_FRAMES) pre_count++;
+            if (vad_voice_start(&speech_frames, rms)) {
                 collecting = true;
                 total = 0;
+                for (unsigned i = 0; i < pre_count; i++) {
+                    unsigned pos = (pre_pos + WAKE_PRE_FRAMES - pre_count + i) % WAKE_PRE_FRAMES;
+                    memcpy(s_wake_buf + total, s_pre_roll[pos], fbytes);
+                    total += fbytes;
+                }
+                speech_frames = pre_count = 0;
                 silence_ms = 0;
+                unsigned mode = atomic_load(&s_listen_mode);
+                if (mode == AUDIO_COMMAND && (int32_t)(atomic_load(&s_command_deadline) - xTaskGetTickCount()) <= 0) {
+                    mode = AUDIO_MONITOR;
+                    atomic_store(&s_listen_mode, mode);
+                }
+                utterance = mode != AUDIO_MONITOR;
+                capture_mode = (audio_listen_mode_t)mode;
                 ESP_LOGI(TAG, "wake: 检测到语音 (rms=%d)", rms);
+                continue; /* current frame is already in the pre-roll */
             } else {
                 continue;
             }
@@ -324,12 +360,13 @@ static void wake_task(void *arg)
         }
         silence_ms = (rms < WAKE_RMS_OFF) ? (silence_ms + WAKE_FRAME_MS) : 0;
 
-        if (silence_ms >= WAKE_SIL_MS || total + fbytes > WAKE_MAX_BYTES) {
+        vad_end_t end = vad_end(utterance, total * 1000 / (AUDIO_RATE_HZ * BYTES_PER_SAMPLE), silence_ms);
+        if (end != VAD_MORE) {
             collecting = false;
             if (total > (size_t)(AUDIO_RATE_HZ * BYTES_PER_SAMPLE / 2)) {   /* >0.5s */
                 ESP_LOGI(TAG, "wake: 片段 %u 字节", (unsigned)total);
                 if (s_clip_cb) {
-                    s_clip_cb(s_wake_buf, total);
+                    s_clip_cb(s_wake_buf, total, end == VAD_LIMIT, capture_mode);
                 }
             }
             total = 0;

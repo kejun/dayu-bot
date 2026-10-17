@@ -99,6 +99,24 @@ class Task:
             "created_at": self.created_at,
         }
 
+    def to_record(self) -> dict:
+        """Private persistence format; never sent as the terminal protocol."""
+        return {"request_id": self.request_id, "text": self.text, "owner": self.owner,
+                "source": self.source, "dedup_key": self.dedup_key, "state": self.state.value,
+                "question": self.question, "question_seq": self.question_seq,
+                "result_kind": self.result_kind.value if self.result_kind else None,
+                "result_text": self.result_text, "evidence": self.evidence,
+                "created_at": self.created_at, "updated_at": self.updated_at,
+                "cancel_requested": self.cancel_requested, "started": self.started,
+                "history": list(self.history)}
+
+    @classmethod
+    def from_record(cls, record: dict) -> "Task":
+        data = dict(record)
+        data["state"] = State(data["state"])
+        data["result_kind"] = ResultKind(data["result_kind"]) if data.get("result_kind") else None
+        return cls(**data)
+
 
 Runner = Callable[[Task], Awaitable[Turn]]
 Notifier = Callable[[Task], None]

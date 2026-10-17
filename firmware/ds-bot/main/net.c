@@ -122,7 +122,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
             char hello[320];   /* hello JSON 约 200 字节，别截断 */
             snprintf(hello, sizeof(hello),
                      "{\"v\":\"1\",\"t\":\"hello\",\"token\":\"%s\",\"device_id\":\"ds-bot\","
-                     "\"fw\":\"0.2.0\",\"audio\":{\"codec\":\"pcm_s16le\",\"rate\":16000,"
+                     "\"fw\":\"0.2.5\",\"audio\":{\"codec\":\"pcm_s16le\",\"rate\":16000,"
                      "\"channels\":1,\"bits\":16}}",
                      CONFIG_DSBOT_BRIDGE_TOKEN);
             esp_websocket_client_send_text(s_ws, hello, strlen(hello), pdMS_TO_TICKS(2000));
@@ -274,7 +274,7 @@ esp_err_t net_send_binary(const void *data, size_t len)
 }
 
 static esp_err_t send_clip(const char *request_id, const char *mode,
-                           const void *data, size_t len, const char *answer_to, uint32_t question_seq)
+                           const void *data, size_t len, const char *answer_to, uint32_t question_seq, bool truncated)
 {
     if (!s_audio_tx_lock || !request_id || !data || !len) return ESP_ERR_INVALID_STATE;
     uint32_t generation = atomic_load(&s_upload_generation);
@@ -286,8 +286,9 @@ static esp_err_t send_clip(const char *request_id, const char *mode,
     char msg[384];
     snprintf(msg, sizeof(msg),
              "{\"v\":\"1\",\"t\":\"audio_start\",\"request_id\":\"%s\",\"mode\":\"%s\","
-             "\"answer_to\":\"%s\",\"question_seq\":%lu}",
-             request_id, mode ? mode : "task", answer_to ? answer_to : "", (unsigned long)question_seq);
+             "\"answer_to\":\"%s\",\"question_seq\":%lu,\"truncated\":%s}",
+             request_id, mode ? mode : "task", answer_to ? answer_to : "", (unsigned long)question_seq,
+             truncated ? "true" : "false");
     esp_err_t err = net_send_json(msg);
     const uint8_t *pcm = data;
     for (size_t off = 0; err == ESP_OK && off < len; off += 4096) {
@@ -313,13 +314,13 @@ static esp_err_t send_clip(const char *request_id, const char *mode,
     return err;
 }
 
-esp_err_t net_send_audio_clip(const char *request_id, const char *mode, const void *data, size_t len)
+esp_err_t net_send_audio_clip(const char *request_id, const char *mode, const void *data, size_t len, bool truncated)
 {
-    return send_clip(request_id, mode, data, len, NULL, 0);
+    return send_clip(request_id, mode, data, len, NULL, 0, truncated);
 }
 
 esp_err_t net_send_answer_clip(const char *clip_id, const char *request_id,
-                               uint32_t question_seq, const void *data, size_t len)
+                               uint32_t question_seq, const void *data, size_t len, bool truncated)
 {
-    return send_clip(clip_id, "answer", data, len, request_id, question_seq);
+    return send_clip(clip_id, "answer", data, len, request_id, question_seq, truncated);
 }

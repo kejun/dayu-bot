@@ -45,9 +45,11 @@ class Config:
     ictrl_host: str = "127.0.0.1:8200"
     ictrl_client: Path = field(default_factory=lambda: VENDOR_ICTRL)
 
-    # --- Agent (Hermes) ---
+    # --- Agent：Pi Durable 默认运行时，Direct / Hermes 显式回退 ---
     hermes_bin: str = "hermes"
-    agent_backend: str = "direct"
+    agent_backend: str = "pi"
+    pi_node: str = "node"
+    pi_data_dir: Path = field(default_factory=lambda: Path.home() / ".dayu" / "pi")
     agent_timeout: int = 21_600         # 每轮执行最多 6 小时；单次接口仍使用短超时
     # 仅启用手机执行所需的 terminal 与 iCTRL skill，减少启动与请求上下文。
     hermes_args: list[str] = field(default_factory=lambda: [
@@ -66,6 +68,7 @@ class Config:
     qwen_plan_max_tokens: int = 768
     qwen_plan_timeout: float = 8.0
     phone_rpc_timeout: float = 8.0
+    phone_recovery_timeout: float = 45.0  # query the original operation, never redispatch it
     phone_screen_chars: int = 6000
     phone_fast_launch: bool = True
     phone_ready_reads: int = 3
@@ -103,7 +106,9 @@ class Config:
                               or base.max_record_ms),
             ictrl_host=_env("ICTRL_HOST", base.ictrl_host) or base.ictrl_host,
             hermes_bin=_env("HERMES_BIN", base.hermes_bin) or base.hermes_bin,
-            agent_backend=_env("BRIDGE_AGENT_BACKEND", "direct") or "direct",
+            agent_backend=_env("BRIDGE_AGENT_BACKEND", base.agent_backend) or base.agent_backend,
+            pi_node=_env("BRIDGE_PI_NODE", base.pi_node) or base.pi_node,
+            pi_data_dir=Path(_env("BRIDGE_PI_DATA_DIR", str(base.pi_data_dir))).expanduser(),
             agent_timeout=int(_env("AGENT_TIMEOUT", str(base.agent_timeout))
                               or base.agent_timeout),
             qwen_api_key=_env("DASHSCOPE_API_KEY", "") or "",
@@ -115,6 +120,7 @@ class Config:
             qwen_plan_max_tokens=int(_env("QWEN_PLAN_MAX_TOKENS", "768")),
             qwen_plan_timeout=float(_env("QWEN_PLAN_TIMEOUT", "8")),
             phone_rpc_timeout=float(_env("PHONE_RPC_TIMEOUT", "8")),
+            phone_recovery_timeout=float(_env("PHONE_RECOVERY_TIMEOUT", "45")),
             phone_screen_chars=int(_env("PHONE_SCREEN_CHARS", "6000")),
             phone_fast_launch=(_env("PHONE_FAST_LAUNCH", "true") or "true").lower() in ("true", "1", "yes"),
             phone_ready_reads=int(_env("PHONE_READY_READS", "3")),
@@ -137,7 +143,7 @@ class Config:
             data = json.loads(f.read_text(encoding="utf-8"))
             for k, v in data.items():
                 if hasattr(cfg, k):
-                    if k in ("ictrl_client", "log_dir", "hermes_runtime_dir"):
+                    if k in ("ictrl_client", "log_dir", "hermes_runtime_dir", "pi_data_dir"):
                         v = Path(v)
                     setattr(cfg, k, v)
         return cfg

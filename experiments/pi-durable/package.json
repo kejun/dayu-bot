@@ -1,0 +1,22 @@
+{
+  "name": "dayu-pi-durable-validation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "validate": "node validate.mjs",
+    "memory": "node validate.mjs --only=memory",
+    "phone": "node validate.mjs --only=phone --phone-samples=3",
+    "benchmark": "node validate.mjs --only=benchmark --samples=20",
+    "voice": "../../host/.venv/bin/python voice_check.py",
+    "context": "node context-check.mjs",
+    "runtime-cost": "node runtime-cost.mjs",
+    "memory-scale": "node memory-scale.mjs"
+  },
+  "engines": { "node": ">=22.19.0" },
+  "dependencies": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0"
+  }
+}

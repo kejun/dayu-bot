@@ -130,16 +130,19 @@ static void on_net_msg(const char *type, const char *json)
     if (!strcmp(tt, "stop_speak")) {
         stop_speaking();
     } else if (!strcmp(tt, "wake")) {
+        audio_listen_mode(AUDIO_COMMAND);
         s_screen_on = true;
         bsp_display_brightness_set(100);
         if (!s_task_active && !s_ptt_busy) ui_set_state(UI_RECORDING);
     } else if (!strcmp(tt, "welcome")) {
+        audio_listen_mode(AUDIO_MONITOR);
         ui_set_net_locked("已连接主机");
     } else if (!strcmp(tt, "status")) {
         const char *st = json_string(root, "state");
         bool active = !strcmp(st, "processing") || !strcmp(st, "need_user") ||
                       !strcmp(st, "cancelling") || !strcmp(st, "recognizing");
         if (active && *rid && (!s_task_active || !strcmp(s_task_id, rid))) {
+            audio_listen_mode(AUDIO_MONITOR);
             task_started(rid);
             if (!strcmp(st, "cancelling")) {
                 if (!s_cancel_sent) s_cancel_started_at = xTaskGetTickCount();
@@ -182,12 +185,14 @@ static void on_net_msg(const char *type, const char *json)
         if (s_task_active && s_question_waiting && !s_cancel_sent && !strcmp(s_task_id, rid) &&
             cJSON_IsNumber(seq) && s_question_seq == (uint32_t)seq->valuedouble) {
             s_answer_listening = true;
+            audio_listen_mode(AUDIO_ANSWER);
             audio_wake_pause(false);
             ui_set_state(UI_LISTENING);
             ESP_LOGI(TAG, "question listening: %s seq=%lu", rid, (unsigned long)s_question_seq);
         }
     } else if (!strcmp(tt, "result")) {
         if (*rid && (!*s_task_id || !strcmp(s_task_id, rid))) {
+            audio_listen_mode(AUDIO_MONITOR);
             strlcpy(s_task_id, rid, sizeof(s_task_id));
             bool was_cancelling = s_cancel_sent || s_state == UI_CANCEL_UNCONFIRMED;
             s_task_active = false;
@@ -314,7 +319,7 @@ static void ptt_task(void *arg)
         bool offline_play = len > AUDIO_RATE_HZ * 2 / 5 && !s_task_active && !net_connected();
         xSemaphoreGive(s_state_lock);
         if (upload) {
-            esp_err_t err = net_send_audio_clip(rid, "task", audio_record_data(), len);
+            esp_err_t err = net_send_audio_clip(rid, "task", audio_record_data(), len, audio_record_truncated());
             if (err != ESP_OK) {
                 xSemaphoreTake(s_state_lock, portMAX_DELAY);
                 if (s_task_active && !s_cancel_sent && s_state != UI_CANCEL_UNCONFIRMED && !strcmp(s_task_id, rid)) {
@@ -337,7 +342,7 @@ static void ptt_task(void *arg)
     }
 }
 
-static void on_wake_clip(const void *pcm, size_t len)
+static void on_wake_clip(const void *pcm, size_t len, bool truncated, audio_listen_mode_t mode)
 {
     if (!net_connected()) return;
     char rid[48], answer_to[sizeof(s_task_id)] = "";
@@ -356,8 +361,8 @@ static void on_wake_clip(const void *pcm, size_t len)
     }
     xSemaphoreGive(s_state_lock);
     snprintf(rid, sizeof(rid), "w%08lx-%lu", (unsigned long)s_boot_id, (unsigned long)++s_wake_seq);
-    esp_err_t err = *answer_to ? net_send_answer_clip(rid, answer_to, question_seq, pcm, len) :
-                                net_send_audio_clip(rid, "wake", pcm, len);
+    esp_err_t err = *answer_to ? net_send_answer_clip(rid, answer_to, question_seq, pcm, len, truncated) :
+                                net_send_audio_clip(rid, mode == AUDIO_COMMAND ? "command" : "wake", pcm, len, truncated);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "wake upload failed: %s", esp_err_to_name(err));
         xSemaphoreTake(s_state_lock, portMAX_DELAY);

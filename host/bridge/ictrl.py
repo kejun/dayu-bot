@@ -44,7 +44,9 @@ def _curl(url: str, *, method: str = "GET", body: bytes | None = None,
         cmd += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
     p = subprocess.run(cmd, input=body, capture_output=True)
     out = p.stdout.decode("utf-8", "replace")
-    if p.returncode != 0 and not out:
+    # --write-out still emits "000" on connection errors/timeouts. Preserve
+    # curl's diagnostic instead of passing an empty response to the RPC client.
+    if p.returncode != 0:
         raise IctrlError(f"curl 失败({p.returncode}): {p.stderr.decode('utf-8','replace').strip()}")
     head, _, tail = out.rpartition("\n")
     code = int(tail) if tail.strip().isdigit() else 0

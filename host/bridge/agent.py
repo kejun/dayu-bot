@@ -136,12 +136,15 @@ class Agent:
 
 
 def make_agent(cfg, args: list[str] | None = None):
+    if cfg.agent_backend == "pi":
+        from .pi_agent import PiAgent
+        return PiAgent(cfg)
     if cfg.agent_backend == "direct":
         from .direct import DirectAgent
         return DirectAgent(cfg)
     if cfg.agent_backend == "hermes":
         return Agent.from_config(cfg, args)
-    raise AgentError("BRIDGE_AGENT_BACKEND 仅支持 direct 或 hermes")
+    raise AgentError("BRIDGE_AGENT_BACKEND 仅支持 pi、direct 或 hermes")
 
 
 def phone_prompt(agent, host: str, text: str, history: list[str] = ()) -> str:

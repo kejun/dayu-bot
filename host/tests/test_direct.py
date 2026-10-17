@@ -71,6 +71,13 @@ class DirectTests(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
         self.temp.cleanup()
 
+    async def test_app_lookup_timeout_reports_connection_failure_without_retry(self):
+        self.phone.fail_method = 'resolve_app'
+        agent = self.agent([tool('open_app', {'app': '微信'})])
+        result = await agent.ask('打开微信')
+        self.assertEqual(result.text, 'DONE: failed; 查询应用失败，请检查手机连接后重试。')
+        self.assertEqual([method for method, _ in self.phone.calls], ['resolve_app'])
+
     def agent(self, replies, task_plan=None):
         messages = iter(replies)
         self.requests = []

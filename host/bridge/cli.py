@@ -99,7 +99,7 @@ def cmd_ask(cfg: Config, args) -> int:
     try:
         async def run():
             try:
-                if cfg.agent_backend == "direct":
+                if cfg.agent_backend in ("pi", "direct"):
                     return await agent.ask(prompt, original=args.text)
                 return await agent.ask(prompt)
             finally:
@@ -187,12 +187,31 @@ def cmd_serve(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_pi_recover(cfg: Config, args) -> int:
+    """Offline only: verify the phone before releasing a durable unknown gate."""
+    from .pi_agent import PiAgent
+    async def run():
+        agent = PiAgent(cfg)
+        try:
+            return await agent.recover_phone()
+        finally:
+            await agent.aclose()
+    try:
+        asyncio.run(run())
+    except (AgentError, RuntimeError) as exc:
+        print(f'通道保持暂停：{exc}', file=sys.stderr)
+        return 1
+    print('已核对当前手机界面并恢复通道；旧任务仍保留原来的未确认结果，不会重放。')
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bridge", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="检查环境").set_defaults(func=cmd_doctor)
+    sub.add_parser("pi-recover", help="停 Bridge 后核对手机并恢复 Pi 暂停通道").set_defaults(func=cmd_pi_recover)
 
     sp = sub.add_parser("pair", help="与 iCTRL 配对")
     sp.add_argument("--host")

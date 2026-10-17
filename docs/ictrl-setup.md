@@ -1,12 +1,16 @@
-# iCTRL：安装、恢复与快速启动
+# iCTRL：安装、动作回执与恢复
 
-更新：2026-10-17。本项目当前通过 **Xcode 构建和常驻测试会话**运行 iPhone Runner，主机使用加密 JSON-RPC 2.0 访问 `:8200`。下方 SideStore / iLoader 内容是历史排错记录，不代表当前验证路线。
+更新：2026-10-18。本项目当前通过 **Xcode 构建和常驻测试会话**运行 iPhone Runner，主机使用加密 JSON-RPC 2.0 访问 `:8200`。下方 SideStore / iLoader 内容是历史排错记录，不代表当前验证路线。
 
 ## 当前部署边界
 
-Runner 源码位于独立仓库 **`/Users/haoyu/code/ictrl`**，不在本仓库中。今天增加的 `launch_mode:"foreground"` 需要构建并部署该仓库的修改，`skill_version` 相同不代表一定包含本机扩展。
+Runner 源码位于独立的 [OpenMinis/iCTRL 仓库](https://github.com/OpenMinis/iCTRL)，本机路径 **`/Users/haoyu/code/ictrl`**，不在本仓库中。本次增加的 `launch_mode:"foreground"` 和 `operation_receipts` 需要构建并部署该仓库的修改，`skill_version` 相同不代表一定包含这些扩展。
 
-本机曾在 iPhone `192.168.1.6:8200` 验证，地址受 DHCP 影响。Bridge 在项目 `.env` 配置 `ICTRL_HOST`，设备换 IP 后也需重新确认按 host:port 保存的配对记录。
+本次可构建版本已推送到 [kejun/iCTRL 的 `feat/dayu-operation-recovery` 分支](https://github.com/kejun/iCTRL/tree/feat/dayu-operation-recovery)，对应提交 [50bcec4](https://github.com/kejun/iCTRL/commit/50bcec4)。当前账号没有上游写权限，这些改动尚未合入 OpenMinis 的 `main`；新环境应使用上述 fork 提交构建。
+
+动作恢复还要求 Runner 的 `device_info.capabilities` 包含 `operation_receipts`。主机为动作附带唯一 `_operation_id`，通过非 UI 通道 `operation_status{operation_id}` 查询 queued/running/succeeded 等状态和真实结果。回执按认证客户端隔离并存到手机本地，同一编号与相同参数不会重复派发；重启前未结束的动作标为未知，不自动重放。不能拿历史日志中同名动作的成功记录冒充当前动作回执。
+
+最近本机测试地址为 iPhone `192.168.1.18:8200`，早期为 `192.168.1.6:8200`，地址受 DHCP 影响。Bridge 在项目 `.env` 配置 `ICTRL_HOST`，设备换 IP 后也需重新确认按 host:port 保存的配对记录。
 
 ## 构建与启动（已验证路线）
 
@@ -24,7 +28,7 @@ xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
   -derivedDataPath build -destination "id=<设备UDID>" -allowProvisioningUpdates
 ```
 
-本机今天已恢复并部署此测试会话。Runner 的 UI 操作授权依赖测试会话，不能只因 App 存活或 `/schema` 可访问就认定 UI 已就绪。不要并行启动多个测试会话控制同一手机。
+本机 2026-10-17 已恢复并部署此测试会话。Runner 的 UI 操作授权依赖测试会话，不能只因 App 存活或 `/schema` 可访问就认定 UI 已就绪。不要并行启动多个测试会话控制同一手机。
 
 开发者镜像 DDI 是运行条件，手机重启后需要确认仍已挂载；Xcode 或设备端挂载路径见下方历史排错。Runner 标识需保留 `.xctrunner` 后缀，历史重签名改写后缀曾导致 XCTest 加载失败。
 
@@ -42,7 +46,36 @@ cd /Users/haoyu/dayu-dot/host
 
 仅首次或确实返回配对失效时重新 `pair`；配对记录位于 `~/.ictrl/token.json`，不要写入项目文档。`doctor` 检查配置和健康接口，实际 `page_source` 成功才能验证 UI 调用权限。读屏诊断前确认没有其他正在执行的手机任务。
 
-## 今天的打开应用提速
+## 动作回执与超时恢复
+
+动作编号是 16–80 位 ASCII 字母、数字、下划线或连字符。主机在本地提交编号及参数，Runner 再按认证客户端保存回执，成功持久化后才派发。`operation_status` 不进入 UI 队列，在 UI 调用卡住时仍可查询；认证客户端身份由服务端注入，不能通过参数冒充。
+
+| 回执状态 | 主机处理 |
+|---|---|
+| `queued` / `running` | 查询同一编号，等待原动作结束，不补发动作 |
+| `succeeded` / `failed` | 读取原结果或错误；成功后核对新画面，再继续剩余目标 |
+| `unknown_after_restart` | Runner 重启前尚在途；保留未知状态并核对实际手机，不能自动重放 |
+| `completed_result_expired` | 原动作已结束但载荷过期；编号仍保留，不能把它当成功结果或重放依据 |
+| `not_found` / `storage_unavailable` | 缺少可靠完成凭据；保留任务等待并诊断，不能据此重复派发 |
+
+回执位于 Runner 沙盒 `Library/Application Support/iCTRL/operation-receipts.json`，目录/文件权限为 0700/0600。最近 512 条完整结果保留，旧结果只移除载荷、不删除编号；最多保存 50,000 个编号，达到上限拒绝新增动作，不能靠清空记录恢复旧请求。动作已发生、结果未落盘时仍可能未知，因此回执不承诺崩溃期间能自动判定所有外部结果。
+
+Bridge 的基础 RPC 超时为 8 秒，`page` / `page_source` / `screen_text` 至少等待 18 秒；Runner 的 6 秒或 15 秒看门狗仍可能先返回。之后最多用 `PHONE_RECOVERY_TIMEOUT=45` 秒查询原编号，Pi 可再核实、诊断及重新规划，暂不能确认时保留进度。主机代码与手机 Runner 必须配套部署。
+
+独立 Runner 仓库的本地回执检查（不访问手机）：
+
+```bash
+cd /Users/haoyu/code/ictrl
+swiftc iCTRLKit/RPCTypes.swift iCTRLKit/AuthManager.swift \
+  iCTRLKit/SecureEnvelope.swift iCTRLKit/TokenFileStore.swift \
+  iCTRLKit/KeychainStore.swift Scripts/test-operation-ledger.swift \
+  -o /private/tmp/dayu-ledger-test
+/private/tmp/dayu-ledger-test
+```
+
+已验证持久化、相同编号去重、客户端隔离、参数绑定及重启未知状态。实机翻页在看门狗 6 秒超时后于 7.274 秒完成，主机查询原编号成功，未再次派发；随后完成推荐流 5 屏浏览，记录见 [验收计划](plan.md)。
+
+## 打开应用提速
 
 本机 Runner 的 `launch_app` 增加参数：
 
@@ -55,9 +88,9 @@ Bridge 默认 `PHONE_FAST_LAUNCH=true`，使用 `foreground` 后立即读屏；�
 
 2026-10-17 对同一已运行淘宝 App 的少量交替样本：普通启动 2.42 / 1.23 秒，快速启动 0.54 / 0.48 秒；启动加首次读屏分别为 3.77 / 1.78 秒与 1.15 / 1.03 秒。记录在 `.runtime/launch-benchmark.json`，不是冷启动或所有 App 的延时保证。
 
-## 默认 direct 与可选 Hermes
+## 默认 Pi 与显式回退后端
 
-默认 Bridge 直接调用千问，并通过固定手机工具使用官方加密客户端；不需要每个任务读取 `/skill` 或启动 Hermes。官方客户端仍保留在 `host/vendor/ictrl_rpc.py`，本机局域网 HTTP 由 curl 适配。
+默认 `BRIDGE_AGENT_BACKEND=pi`，常驻 Node / Pi Durable 管理千问循环与持久状态，Python 的固定手机工具使用官方加密客户端；不需要每个任务读取 `/skill` 或启动 Hermes。正式安装和恢复见 [Pi 运行时](../host/pi/README.md)。`direct` / `hermes` 仅供显式回退，不能与 Bridge 并行控制同一手机。官方客户端保留在 `host/vendor/ictrl_rpc.py`，本机局域网 HTTP 由 curl 适配。
 
 显式设 `BRIDGE_AGENT_BACKEND=hermes` 时才使用 Hermes CLI。需要安装技能可运行：
 
@@ -66,22 +99,24 @@ cd /Users/haoyu/dayu-dot/host
 ./.venv/bin/python -m bridge.cli install-skill
 ```
 
-该命令是可选 Hermes 后端的准备步骤，不是默认 direct 路径的前置条件。
+该命令是可选 Hermes 后端的准备步骤，不是默认 Pi 路径的前置条件。
 
 ## 恢复与排错
 
 | 现象 | 当前处理 |
 |---|---|
 | `/schema` 或 `/skill` 不可达 | 检查地址、Remote Access、网络、Runner 测试会话和 DDI |
+| Runner 恢复后旧地址仍不可达 | 核对 Runner 启动日志中的当前 IP，更新 `.env` 的 `ICTRL_HOST`；配对记录按 host:port 保存，需核查新地址的配对，再实际读屏 |
 | 健康接口通但 `Not authorized for performing UI testing actions` | 恢复 `xcodebuild test-without-building` 会话，再实际读屏验证 |
 | 手机锁屏或需要密码 | 解锁后继续；不能把点亮屏幕当成已完成解锁 |
 | 返回 `401` / 配对失效 | 确认 host:port，重新配对并在手机批准 |
-| UI 调用超时、操作结果未知 | 停止重复派发，检查手机和 Runner 日志；必要时使用诊断 `logs` / `reset`，清理后核对实际结果 |
+| UI 调用超时、操作结果未知 | 先以原编号查询 `operation_status`；成功后核对新画面继续，未确认则保留进度。`logs` 辅助诊断，`reset` 不能取消在途动作 |
+| `find_element` 明确返回控件树无响应且已结束 | 保持本任务继续，改用 OCR 与设备状态核验前台身份；不补读故障 AX 树，仍可能执行中的超时请求不适用此恢复 |
 | 明确 `Could not open '<bundle_id>'...` | 任务按普通启动失败结束，检查应用是否安装及标识是否正确；不因该固定拒绝消息要求重启 Bridge |
-| Bridge 报手机通道已暂停 | 本地收尾或动作结果无法确认；核对实际手机状态、处理 Runner 故障，再安全重启 Bridge；不自动重跑旧任务 |
+| Bridge 报手机通道已暂停 | 有编号时先让 Pi 核实原回执；遗留无编号或本地收尾故障按 [Pi 恢复流程](../host/pi/README.md)停服核查并执行 `pi-recover`，仅重启不会解除持久保护 |
 | Python 访问 LAN 报 `No route to host`，curl 正常 | 检查 macOS 本地网络权限；项目保留 curl 适配，见历史记录 |
 
-本机日志为 `~/.dayu/logs/ictrl-runner.log`、`bridge.log`，任务详情位于 `.runtime/direct/<trace_id>/`。桥接服务重启与 Runner 重启是不同步骤，不应把所有应用失败都归结为重启网关。
+本机日志为 `~/.dayu/logs/ictrl-runner.log`、`bridge.log`；正式任务详情位于 `~/.dayu/pi/` 的 SQLite、`plans/` 和 `traces/`，显式 direct 回退使用 `.runtime/direct/<trace_id>/`。桥接服务重启与 Runner 重启是不同步骤，不应把所有应用失败都归结为重启网关。
 
 ## 历史安装与网络排错记录（2026-10-16）
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dayu-bridge"
 version = "0.1.0"
-description = "Host-side connector: ESP32 voice terminal -> Hermes Agent -> iCTRL (iPhone)"
+description = "ESP32 voice bridge with Pi Durable, Qwen and bounded iCTRL phone tools"
 requires-python = ">=3.10"
 dependencies = [
     "websockets>=14",      # native async cloud TTS, cancellable WebSocket requests

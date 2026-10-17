@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define AUDIO_RATE_HZ   16000
-#define AUDIO_MAX_SEC   10          /* 单次录音上限（PRD §5.1 要求 ≤60s，这里先给 10s） */
+#define AUDIO_MAX_SEC   30
 
 esp_err_t audio_init(void);
 
@@ -27,6 +27,7 @@ size_t    audio_record_stop(void);
 /* 录音缓冲指针与长度 */
 const void *audio_record_data(void);
 size_t      audio_record_size(void);
+bool        audio_record_truncated(void);
 
 /* 播放一段 PCM */
 esp_err_t audio_play(const void *data, size_t len);
@@ -40,7 +41,9 @@ esp_err_t audio_play_tone(int freq_hz, int ms);
 
 /* ---- 唤醒词：空闲时做 VAD 采集 ---- */
 /* 检出一段有语音的片段时回调（在采集任务上下文，**不要阻塞太久**） */
-typedef void (*audio_clip_cb_t)(const void *pcm, size_t len);
+typedef enum { AUDIO_MONITOR, AUDIO_COMMAND, AUDIO_ANSWER } audio_listen_mode_t;
+typedef void (*audio_clip_cb_t)(const void *pcm, size_t len, bool truncated, audio_listen_mode_t mode);
+void audio_listen_mode(audio_listen_mode_t mode);
 
 /* 启动空闲监听（VAD） */
 esp_err_t audio_wake_start(audio_clip_cb_t cb);

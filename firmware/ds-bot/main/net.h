@@ -38,9 +38,9 @@ esp_err_t net_send_json(const char *json);
 esp_err_t net_send_binary(const void *data, size_t len);
 /* 录音起止帧与 PCM 必须作为一个事务发送，避免 PTT / VAD 交错。 */
 esp_err_t net_send_audio_clip(const char *request_id, const char *mode,
-                              const void *data, size_t len);
+                              const void *data, size_t len, bool truncated);
 esp_err_t net_send_answer_clip(const char *clip_id, const char *request_id,
-                               uint32_t question_seq, const void *data, size_t len);
+                               uint32_t question_seq, const void *data, size_t len, bool truncated);
 void net_cancel_audio_uploads(void);
 /* 可从任意任务调用；令尚未接收完的旧 TTS 失效。 */
 void net_discard_speech(void);

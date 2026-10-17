@@ -75,6 +75,9 @@ class Bridge:
         self.tts = tts
         self.say = say            # bridge.tts.QwenTts（云端 TTS）
         self.tasks = TaskManager(self._runner, notify=self._on_task)
+        if hasattr(agent, "checkpoint") and hasattr(agent, "restored_tasks"):
+            from .pi_agent import DurableTaskManager
+            self.tasks = DurableTaskManager(self._runner, self._on_task, agent)
         self._clients: dict[object, dict] = {}
         self._speak_id = 0
         self._pending_audio: dict[str, PendingAudio] = {}
@@ -84,11 +87,17 @@ class Bridge:
         self._speech_jobs: set[asyncio.Task] = set()
         self._send_locks: dict[object, asyncio.Lock] = {}
         self._speech_epoch = 0
+        self._received_ids: set[str] = set()
+        self._receipt_pcm = None
+        self._receipt_prepare = None
 
     # ---------------------------------------------------------------- server
     async def serve_forever(self) -> None:
-        self.tasks.start()
         try:
+            if hasattr(self.tasks, "restore"):
+                await self.tasks.restore()
+            await self._receipt_audio()
+            self.tasks.start()
             async with ws_serve(self._handler, self.cfg.bind, self.cfg.port,
                                 max_size=8 * 1024 * 1024, ping_interval=20):
                 log.info("网关已启动 ws://%s:%d/ws", self.cfg.bind, self.cfg.port)
@@ -102,11 +111,15 @@ class Bridge:
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
-        await self.tasks.stop()
-        if self.stt is not None and hasattr(self.stt, "aclose"):
-            await self.stt.aclose()
-        if hasattr(self.agent, "aclose"):
-            await self.agent.aclose()
+        try:
+            await self.tasks.stop()
+        finally:
+            try:
+                if self.stt is not None and hasattr(self.stt, "aclose"):
+                    await self.stt.aclose()
+            finally:
+                if hasattr(self.agent, "aclose"):
+                    await self.agent.aclose()
 
     async def _handler(self, ws) -> None:
         # --- 握手认证 ---
@@ -136,7 +149,7 @@ class Bridge:
                  "wake_jobs": 0, "awake_until": 0.0,
                  "cancel_awake_until": 0.0, "cancel_targets": ()}
         self._clients[ws] = state
-        log.info("终端 %s 已连接 (device=%s)", session, state["device_id"])
+        log.info("终端 %s 已连接 (device=%s fw=%s)", session, state["device_id"], state['fw'])
         await self._send(ws, P.welcome(session, self.cfg.audio().as_dict()))
         # A reconnect must replay the pending question, never silently resume work.
         for task in self.tasks.unfinished(state["device_id"]):
@@ -222,13 +235,16 @@ class Bridge:
             state["audio"] = bytearray()
             state["request_id"] = msg["request_id"]
             state["mode"] = msg.get("mode", "task")
+            state['clip_command_session'] = (state.get('command_session') if state['mode']=='command'
+                and time.monotonic()<state.get('command_until',0) else None)
+            state['clip_truncated'] = msg.get('truncated') is True
             state["clip_targets"] = self._targets(state)
             state["clip_answer_target"] = self._answer_target(state)
             if state["mode"] == "answer" and state["clip_answer_target"] != (
                     msg.get("answer_to"), msg.get("question_seq")):
                 state["clip_answer_target"] = None
             state["clip_epoch"] = self._speech_epoch
-            if state["mode"] not in ("wake", "answer"):
+            if state["mode"] not in ("wake", "answer", 'command'):
                 await self._send(ws, P.status(msg["request_id"], State.RECORDING.value))
 
         elif t == P.Msg.AUDIO_ABORT:
@@ -248,8 +264,22 @@ class Bridge:
             data = bytes(state["audio"])
             state["audio"] = bytearray()
             state["request_id"] = None
+            legacy_cut = mode == 'wake' and state.get('fw') == '0.2.0' and len(data) >= 160000
+            cut = state.get('clip_truncated') or msg.get('truncated') is True or legacy_cut
+            if cut and (mode not in ('wake','command') or state.get('clip_answer_target')):
+                text = '录音达到长度上限，任务未提交，请缩短后重新说。'
+                await self._send(ws, P.result(rid, 'failed', text))
+                if state.get('clip_answer_target'):
+                    state['listen_target'] = None
+                    self._queue_speech(text, question_target=state['clip_answer_target'], owner=str(state['device_id']))
+                else:
+                    self._queue_speech(text, owner=str(state['device_id']))
+                    if mode == 'wake':
+                        state['awake_until'] = time.monotonic() + self.AWAKE_SECONDS
+                        await self._send(ws, P._msg('wake'))
+                return
             if len(data) < 1600:                   # <50ms，视为无效录音
-                if mode not in ("wake", "answer"):
+                if mode not in ("wake", "answer", "command"):
                     await self._send(ws, P.status(rid, "idle"))
                 if state.get("clip_answer_target"):
                     await self._open_answer(ws, state, state["clip_answer_target"])
@@ -259,7 +289,7 @@ class Bridge:
                 if state.get("clip_answer_target"):
                     await self._open_answer(ws, state, state["clip_answer_target"])
                 return
-            if mode in ("wake", "answer"):
+            if mode in ("wake", "answer", 'command'):
                 # STT 后台执行，WebSocket 始终能接收长按取消帧。
                 if state.get("wake_jobs", 0) < 2:
                     target = state.get("clip_answer_target")
@@ -269,7 +299,8 @@ class Bridge:
                     state["wake_jobs"] = state.get("wake_jobs", 0) + 1
                     self._spawn(self._on_wake_clip(ws, state, rid, data,
                                 state.get("clip_targets", ()), state.get("clip_epoch", 0),
-                                target, answer_clip=mode == "answer"))
+                                target, answer_clip=mode == "answer", truncated=bool(cut),
+                                command_clip=mode=='command', command_session=state.get('clip_command_session')))
                 elif state.get("clip_answer_target"):
                     await self._open_answer(ws, state, state["clip_answer_target"])
                 return
@@ -344,7 +375,7 @@ class Bridge:
         owner = str(state["device_id"])
         ids = [task.request_id for task in self.tasks.unfinished(owner)]
         ids.extend(rid for rid, p in self._pending_audio.items() if p.owner == owner)
-        if state.get("request_id") and state.get("mode", "task") not in ("wake", "answer"):
+        if state.get("request_id") and state.get("mode", "task") not in ("wake", "answer", 'command'):
             ids.append(state["request_id"])
         return tuple(dict.fromkeys(ids))
 
@@ -415,7 +446,7 @@ class Bridge:
         changed = [rid for rid in live if
                    (rid in self._pending_audio and not self._pending_audio[rid].cancelling)
                    or (self.tasks.get(rid) and not self.tasks.get(rid).cancel_requested)
-                   or (rid == state.get("request_id") and state.get("mode", "task") not in ("wake", "answer"))]
+                   or (rid == state.get("request_id") and state.get("mode", "task") not in ("wake", "answer", "command"))]
         if not changed:
             return
         batch = self._cancel_batches.get(owner)
@@ -425,13 +456,14 @@ class Bridge:
             batch.had_actions = batch.had_actions or had_actions
         else:
             self._cancel_batches[owner] = CancelBatch(set(changed), had_actions)
-        state["awake_until"] = state["cancel_awake_until"] = 0.0
+        state["awake_until"] = state["cancel_awake_until"] = state['command_until'] = 0.0
+        state['command_session'] = state.get('command_session',0)+1
         self._speech_epoch += 1
         for job in list(self._speech_jobs):
             job.cancel()
         self._broadcast(P.stop_speak())
         for rid in changed:
-            if rid == state.get("request_id") and state.get("mode", "task") not in ("wake", "answer"):
+            if rid == state.get("request_id") and state.get("mode", "task") not in ("wake", "answer", "command"):
                 state["audio"] = bytearray()
                 state["request_id"] = None
                 if rid not in self._pending_audio and not self.tasks.get(rid):
@@ -485,6 +517,12 @@ class Bridge:
     # ------------------------------------------------------------- 任务回调
     def _on_task(self, task: Task) -> None:
         """任务状态变化 → 推给所有已连接终端。"""
+        if task.state == State.PROCESSING and task.source == 'voice' and task.request_id not in self._received_ids:
+            self._received_ids.add(task.request_id)
+            if len(self._received_ids) > 500:
+                self._received_ids = {task.request_id, *(t.request_id for t in self.tasks.unfinished())}
+            self._queue_speech('我已经收到了', owner=task.owner)
+            log.info('voice_received request_id=%s chars=%d', task.request_id, len(task.text))
         if task.state == State.NEED_USER:
             # A fast planner can ask before the wake greeting has finished synthesis.
             self._speech_epoch += 1
@@ -504,7 +542,7 @@ class Bridge:
             return
         self._broadcast(self._task_message(task), owner=task.owner)
         if task.state == State.DONE and task.result_text:
-            self._queue_speech(task.result_text)
+            self._queue_speech(task.result_text, owner=task.owner)
         elif task.state == State.NEED_USER and task.question:
             self._queue_speech(task.question, question_target=(task.request_id, task.question_seq),
                                owner=task.owner)
@@ -521,7 +559,7 @@ class Bridge:
 
     # -------------------------------------------------------------- runner
     async def _runner(self, task: Task) -> Turn:
-        """把任务交给 Agent（Hermes）执行；Agent 内部通过 iCTRL 操作手机。"""
+        """把任务交给当前 Agent 运行时，通过受控 iCTRL 工具操作手机。"""
         prompt = self._build_prompt(task)
         try:
             if hasattr(self.agent, "ask_task"):
@@ -581,10 +619,12 @@ class Bridge:
     async def _on_wake_clip(self, ws, state: dict, rid: str, data: bytes,
                             targets: tuple[str, ...], epoch: int,
                             answer_target: tuple[str, int] | None = None,
-                            *, answer_clip: bool = False) -> None:
+                            *, answer_clip: bool = False, truncated: bool = False,
+                            command_clip: bool = False, command_session: int | None = None) -> None:
         try:
             await self._recognize_wake_clip(ws, state, rid, data, targets, epoch,
-                                            answer_target, answer_clip=answer_clip)
+                                            answer_target, answer_clip=answer_clip, truncated=truncated,
+                                            command_clip=command_clip, command_session=command_session)
         finally:
             # Empty/failed recognition leaves the same question paused and listening.
             if answer_target and self._current_question(state, answer_target):
@@ -593,7 +633,8 @@ class Bridge:
     async def _recognize_wake_clip(self, ws, state: dict, rid: str, data: bytes,
                             targets: tuple[str, ...], epoch: int,
                             answer_target: tuple[str, int] | None = None,
-                            *, answer_clip: bool = False) -> None:
+                            *, answer_clip: bool = False, truncated: bool = False,
+                            command_clip: bool = False, command_session: int | None = None) -> None:
         """普通执行只监听取消；等待追问时接收原任务的回答，目标均在采集时绑定。"""
         try:
             text = (await self.stt(data, self.cfg.audio().as_dict())).strip()
@@ -610,6 +651,8 @@ class Bridge:
         now = time.monotonic()
         compact = _compact(text)
         if is_voice_cancel(text):
+            state['awake_until'] = state['command_until'] = 0.0
+            state['command_session'] = state.get('command_session',0)+1
             self._request_cancel(ws, state, targets)
             return
         if epoch != self._speech_epoch:
@@ -624,7 +667,7 @@ class Bridge:
                   and compact in _CANCEL_WORDS):
                 self._request_cancel(ws, state, tuple(state.get("cancel_targets", ())))
                 return
-            if answer_target and compact:
+            if answer_target and compact and not truncated:
                 answer = self._strip_wake_prefix(text)
                 if _compact(answer):
                     self._accept_voice_answer(state, answer_target, answer, rid)
@@ -634,18 +677,45 @@ class Bridge:
             return
         if answer_clip:
             return  # A late answer never becomes a new command after task completion.
+        if command_clip and command_session is None:
+            await self._send(ws, P.result(rid, 'failed', '唤醒会话已过期，请重新唤醒后下达任务。'))
+            return
+        if command_clip and command_session != state.get('command_session'):
+            return  # A consumed wake ticket cannot start another task.
         normal = unicodedata.normalize("NFKC", text)
         wake = re.match(r"^(?:小\s*[d弟迪地滴][\s，。,.、！!？?]*){1,2}", normal, re.I)
+        if truncated:
+            # Idle monitor clips can be capped while hearing unrelated speech.
+            # Only an actual wake/session may prompt a retry; never execute its head.
+            if wake or now < state.get('awake_until', 0) or command_clip:
+                state['awake_until'] = now + self.AWAKE_SECONDS
+                state['command_until'] = now + self.AWAKE_SECONDS + 35
+                state['command_session'] = state.get('command_session',0)+1
+                await self._send(ws, P._msg('wake'))
+                text = '录音达到长度上限，任务未提交，请重新完整说出指令。'
+                await self._send(ws, P.result(rid, 'failed', text))
+                self._queue_speech(text, owner=str(state['device_id']))
+            return
         if wake:
             state["awake_until"] = now + self.AWAKE_SECONDS
+            state['command_until'] = now + self.AWAKE_SECONDS + 35
+            state['command_session'] = state.get('command_session',0)+1
             cmd = normal[wake.end():].strip("，。,.、 ！!？?")
-            self._broadcast(P._msg("wake"))
-            self._queue_speech("有什么事儿，我在听")
+            await self._send(ws, P._msg("wake"))
             if len(cmd) >= 2:
+                state['awake_until'] = 0.0
+                state['command_until'] = 0.0
+                state['command_session'] += 1
                 self.tasks.submit(f"{rid}-cmd", cmd, source="voice", owner=str(state["device_id"]))
+            else:
+                self._queue_speech("有什么事儿，我在听", owner=str(state['device_id']))
             return
-        if now < state.get("awake_until", 0) and len(text) >= 2:
-            state["awake_until"] = now + self.AWAKE_SECONDS
+        if (command_clip or now < state.get("awake_until", 0)) and len(text) >= 2:
+            if re.fullmatch(r'[嗯啊呃额哦噢唔]+', compact):
+                return
+            state["awake_until"] = 0.0
+            state['command_until'] = 0.0
+            state['command_session'] = state.get('command_session',0)+1
             self.tasks.submit(f"{rid}-cmd", text, source="voice", owner=str(state["device_id"]))
 
     @staticmethod
@@ -654,6 +724,21 @@ class Bridge:
                       flags=re.I).strip("，。,.、 ！!？?")
 
     # ---------------------------------------------------------------- TTS
+    async def _receipt_audio(self):
+        """Warm a short cloud-generated acknowledgement once per service run."""
+        if self._receipt_pcm is not None or self.say is None:
+            return self._receipt_pcm
+        if self._receipt_prepare is None:
+            async def prepare():
+                try:
+                    return await self.say.synthesize('我已经收到了')
+                except Exception as exc:
+                    log.warning('确认语音预热失败: %s', type(exc).__name__)
+                    return None
+            self._receipt_prepare = self._spawn(prepare())
+        self._receipt_pcm = await asyncio.shield(self._receipt_prepare)
+        return self._receipt_pcm
+
     async def _speak_all(self, text: str, *, epoch: int | None = None,
                          question_target: tuple[str, int] | None = None,
                          owner: str | None = None, sockets: tuple | None = None) -> None:
@@ -665,7 +750,7 @@ class Bridge:
         pcm = None
         if self.say and text.strip():
             try:
-                pcm = await self.say.synthesize(text)
+                pcm = await self._receipt_audio() if text == '我已经收到了' else await self.say.synthesize(text)
             except Exception as e:  # noqa: BLE001
                 log.warning("TTS 合成失败: %r", e)
         if epoch != self._speech_epoch:
