@@ -44,6 +44,14 @@ class Config:
     # --- Agent (Hermes) ---
     hermes_bin: str = "hermes"
     agent_timeout: int = 600            # 秒（手机多步操作较慢）
+    # 关键优化：默认加载 21 个工具（~43KB schema）+ 133 个 skill 索引（~12KB）
+    # 会让每次模型调用很慢（实测能拖到 300s 超时）。限定成「只要 terminal +
+    # 预载 ictrl skill + 自动批准」后，同样的任务 ~10s。
+    hermes_args: list[str] = field(default_factory=lambda: [
+        "-t", "terminal",
+        "--skills", "ictrl-phone-control",
+        "--yolo",
+    ])
 
     # --- 语音识别（whisper.cpp，本地免费）---
     stt_binary: str = "whisper-cli"

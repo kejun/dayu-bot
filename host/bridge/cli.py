@@ -84,7 +84,7 @@ def cmd_phone(cfg: Config, args) -> int:
 def cmd_ask(cfg: Config, args) -> int:
     """阶段 1：纯文字驱动 Agent + iCTRL，无需 ESP32。"""
     agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout,
-                  args=args.hermes_args or [])
+                  args=args.hermes_args or cfg.hermes_args)
     if not agent.available()[0]:
         print("找不到 Hermes，可设 HERMES_BIN", file=sys.stderr)
         return 1
@@ -123,7 +123,8 @@ def cmd_serve(cfg: Config, args) -> int:
     from .speech import WhisperCpp
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout, args=args.hermes_args or [])
+    agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout,
+                  args=args.hermes_args or cfg.hermes_args)
     stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
     ok, why = stt.available()
     print(f"语音识别: {'OK' if ok else '不可用'} — {why}")

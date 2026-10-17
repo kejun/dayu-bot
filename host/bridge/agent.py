@@ -94,7 +94,7 @@ class Agent:
         if not shutil.which(self.bin):
             raise AgentError(f"找不到 Agent 可执行文件 {self.bin!r}")
         proc = await asyncio.create_subprocess_exec(
-            self.bin, "-z", prompt, *self.args,
+            self.bin, *self.args, "-z", prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
