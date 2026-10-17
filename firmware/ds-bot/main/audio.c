@@ -81,7 +81,7 @@ esp_err_t audio_init(void)
     ESP_ERROR_CHECK(esp_codec_dev_open(s_spk, &fs));
     ESP_ERROR_CHECK(esp_codec_dev_open(s_mic, &fs));
     esp_codec_dev_set_out_vol(s_spk, 100);   /* 音量曲线 100 = 0dB（满幅） */
-    esp_codec_dev_set_in_gain(s_mic, 36.0f);
+    esp_codec_dev_set_in_gain(s_mic, 30.0f);
 
     if (!s_buf) {
         s_buf = heap_caps_malloc(MAX_BYTES, MALLOC_CAP_SPIRAM);
@@ -190,9 +190,9 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
  */
 #define WAKE_FRAME_MS   20
 #define WAKE_MAX_MS     2500
-#define WAKE_SIL_MS     700
-#define WAKE_RMS_ON     1400      /* 起录阈值 */
-#define WAKE_RMS_OFF    700       /* 静音判定阈值 */
+#define WAKE_SIL_MS     900
+#define WAKE_RMS_ON     1200      /* 起录阈值 */
+#define WAKE_RMS_OFF    600       /* 静音判定阈值 */
 #define WAKE_FRAME_BYTES (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_FRAME_MS / 1000)
 #define WAKE_MAX_BYTES   (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_MAX_MS / 1000)
 
@@ -217,6 +217,8 @@ static void wake_task(void *arg)
     size_t total = 0;
     int silence_ms = 0;
     bool collecting = false;
+    int max_rms = 0;            /* 诊断：每秒打印最大 RMS，便于标定阈值 */
+    int diag_ms = 0;
 
     while (1) {
         if (s_wake_paused || !s_wake_buf) {
@@ -230,6 +232,11 @@ static void wake_task(void *arg)
             continue;
         }
         int rms = frame_rms(frame, fbytes / 2);
+        if (rms > max_rms) max_rms = rms;
+        if ((diag_ms += WAKE_FRAME_MS) >= 2000) {
+            ESP_LOGI(TAG, "wake: 2s 内最大 rms=%d (阈值 %d)", max_rms, WAKE_RMS_ON);
+            max_rms = 0; diag_ms = 0;
+        }
 
         if (!collecting) {
             if (rms > WAKE_RMS_ON) {

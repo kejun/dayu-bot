@@ -114,7 +114,14 @@ static void on_net_msg(const char *type, const char *json)
     cJSON *t = cJSON_GetObjectItem(root, "t");
     const char *tt = cJSON_IsString(t) ? t->valuestring : type;
 
-    if (!strcmp(tt, "welcome")) {
+    if (!strcmp(tt, "wake")) {
+        /* 唤醒：亮屏 + 进入「在听」状态 */
+        if (!s_screen_on) {
+            s_screen_on = true;
+            bsp_display_brightness_set(100);
+        }
+        ui_set_state_locked(UI_RECORDING);
+    } else if (!strcmp(tt, "welcome")) {
         ui_set_net_locked("已连接主机");
     } else if (!strcmp(tt, "notice")) {
         cJSON *txt = cJSON_GetObjectItem(root, "text");

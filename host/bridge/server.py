@@ -238,6 +238,16 @@ class Bridge:
             return
         if not text:
             return
+        # 诊断：把片段存下来（方便离线分析音质）
+        try:
+            from .speech import _wav_bytes
+            import os
+            os.makedirs("/tmp/wake_clips", exist_ok=True)
+            n = len(os.listdir("/tmp/wake_clips"))
+            with open(f"/tmp/wake_clips/clip_{n:03d}.wav", "wb") as fh:
+                fh.write(_wav_bytes(data, 16000, 1, 16))
+        except Exception:
+            pass
         log.info("唤醒片段: %r", text)
         now = time.time()
         hit = self.WAKEWORD in text
@@ -246,6 +256,7 @@ class Bridge:
             self._awake_until = now + self.AWAKE_SECONDS
             cmd = text.replace(self.WAKEWORD, "").strip("，。,.、 ！!？?")
             log.info("🔔 唤醒词命中（剩余指令: %r）", cmd)
+            self._broadcast(P._msg("wake"))
             await self._speak_all("有什么事儿，我在听")
             if len(cmd) >= 2:
                 self.tasks.submit(f"{rid}-cmd", cmd, source="voice")
