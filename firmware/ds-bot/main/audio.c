@@ -2,8 +2,10 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "bsp/esp-bsp.h"
@@ -18,15 +20,21 @@ static esp_codec_dev_handle_t s_spk;
 static esp_codec_dev_handle_t s_mic;
 
 static uint8_t *s_buf;              /* PSRAM 录音缓冲 */
-static volatile bool s_recording;
+static atomic_bool s_recording;
 static volatile size_t s_rec_len;
 static TaskHandle_t s_rec_task;
+static SemaphoreHandle_t s_mic_lock;
+static SemaphoreHandle_t s_play_lock;
+static SemaphoreHandle_t s_rec_done;
+static atomic_uint s_play_generation;
+static atomic_bool s_playing;
 
 static void rec_task(void *arg)
 {
     (void)arg;
     const size_t chunk = 2048;
     size_t total = 0;
+    xSemaphoreTake(s_mic_lock, portMAX_DELAY);
     ESP_LOGI(TAG, "recording start");
     while (s_recording && (total + chunk) <= MAX_BYTES) {
         int ret = esp_codec_dev_read(s_mic, s_buf + total, chunk);
@@ -38,6 +46,7 @@ static void rec_task(void *arg)
     }
     s_rec_len = total;
     s_recording = false;
+    xSemaphoreGive(s_mic_lock);
 
     /* 诊断：看麦克风到底录到了什么 */
     const int16_t *p = (const int16_t *)s_buf;
@@ -55,15 +64,21 @@ static void rec_task(void *arg)
              (unsigned)total, (double)total / (AUDIO_RATE_HZ * BYTES_PER_SAMPLE),
              (int)mx, rms);
     s_rec_task = NULL;
+    xSemaphoreGive(s_rec_done);
     vTaskDelete(NULL);
 }
 
 esp_err_t audio_init(void)
 {
-    if (s_spk && s_mic) {
+    if (s_spk && s_mic && s_buf && s_mic_lock && s_play_lock && s_rec_done) {
         return ESP_OK;
     }
 
+    s_mic_lock = xSemaphoreCreateMutex();
+    s_play_lock = xSemaphoreCreateMutex();
+    s_rec_done = xSemaphoreCreateBinary();
+    if (!s_mic_lock || !s_play_lock || !s_rec_done) return ESP_ERR_NO_MEM;
+    xSemaphoreGive(s_rec_done);
     s_spk = bsp_audio_codec_speaker_init();
     s_mic = bsp_audio_codec_microphone_init();
     if (!s_spk || !s_mic) {
@@ -97,16 +112,21 @@ esp_err_t audio_init(void)
 
 esp_err_t audio_record_start(void)
 {
-    if (!s_mic) {
+    if (!s_mic || !s_buf || !s_rec_done) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_recording) {
         return ESP_OK;
     }
+    /* PTT 已使旧播放失效；等待最后一次 codec write 返回再开始采集。 */
+    xSemaphoreTake(s_play_lock, portMAX_DELAY);
+    xSemaphoreGive(s_play_lock);
+    if (xSemaphoreTake(s_rec_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
     s_rec_len = 0;
     s_recording = true;
     if (xTaskCreate(rec_task, "dsbot_rec", 4096, NULL, 6, &s_rec_task) != pdPASS) {
         s_recording = false;
+        xSemaphoreGive(s_rec_done);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -114,14 +134,11 @@ esp_err_t audio_record_start(void)
 
 size_t audio_record_stop(void)
 {
-    if (!s_recording) {
-        return s_rec_len;
-    }
+    if (!s_rec_done) return 0;
     s_recording = false;
-    /* 等采集任务收尾（最多 ~200ms） */
-    for (int i = 0; i < 100 && s_rec_task; i++) {
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
+    /* codec read 超时可达 1 秒；必须收到任务完成，才能复用缓冲。 */
+    xSemaphoreTake(s_rec_done, portMAX_DELAY);
+    xSemaphoreGive(s_rec_done);
     return s_rec_len;
 }
 
@@ -137,16 +154,42 @@ size_t audio_record_size(void)
 
 esp_err_t audio_play(const void *data, size_t len)
 {
-    if (!s_spk || !data || !len) {
+    return audio_play_current(data, len, audio_play_generation());
+}
+
+uint32_t audio_play_generation(void)
+{
+    return atomic_load(&s_play_generation);
+}
+
+void audio_play_cancel(void)
+{
+    atomic_fetch_add(&s_play_generation, 1);
+}
+
+esp_err_t audio_play_current(const void *data, size_t len, uint32_t generation)
+{
+    if (!s_spk || !s_play_lock || !data || !len) {
         return ESP_ERR_INVALID_ARG;
     }
+    xSemaphoreTake(s_play_lock, portMAX_DELAY);
+    if (generation != audio_play_generation()) {
+        xSemaphoreGive(s_play_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_playing = true;
+    esp_err_t result = ESP_OK;
     /* 软件增益：硬件已拉满，但源音频（麦克风回放/TTS）电平往往偏低 */
     const float gain = 2.0f;
-    static int16_t stage[2048];
+    int16_t stage[AUDIO_RATE_HZ / 50]; /* 20ms 边界检查取消 */
     const int16_t *src = (const int16_t *)data;
     size_t total = len / 2;
     size_t done = 0;
     while (done < total) {
+        if (generation != audio_play_generation()) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
         size_t n = total - done;
         if (n > sizeof(stage) / sizeof(stage[0])) {
             n = sizeof(stage) / sizeof(stage[0]);
@@ -160,11 +203,21 @@ esp_err_t audio_play(const void *data, size_t len)
         int ret = esp_codec_dev_write(s_spk, stage, (int)(n * sizeof(int16_t)));
         if (ret != ESP_CODEC_DEV_OK) {
             ESP_LOGE(TAG, "write failed: %d", ret);
-            return ESP_FAIL;
+            result = ESP_FAIL;
+            break;
         }
         done += n;
     }
-    return ESP_OK;
+    /* BSP uses 6 DMA descriptors × 240 frames = 90ms at 16kHz. Writing 120ms
+     * of silence drains the last speech samples before a playback receipt. */
+    memset(stage, 0, sizeof(stage));
+    for (int tail = 0; result == ESP_OK && tail < 6; ++tail) {
+        if (generation != audio_play_generation()) result = ESP_ERR_INVALID_STATE;
+        else if (esp_codec_dev_write(s_spk, stage, sizeof(stage)) != ESP_CODEC_DEV_OK) result = ESP_FAIL;
+    }
+    s_playing = false;
+    xSemaphoreGive(s_play_lock);
+    return result;
 }
 
 esp_err_t audio_play_tone(int freq_hz, int ms)
@@ -189,7 +242,7 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
  * （上层发给主机做识别，找「小弟」）。
  */
 #define WAKE_FRAME_MS   20
-#define WAKE_MAX_MS     2500
+#define WAKE_MAX_MS     5000      /* 容纳完整“小D小D，取消任务”，避免慢速口令被截成半句 */
 #define WAKE_SIL_MS     900
 #define WAKE_RMS_ON     1200      /* 起录阈值 */
 #define WAKE_RMS_OFF    600       /* 静音判定阈值 */
@@ -197,7 +250,8 @@ esp_err_t audio_play_tone(int freq_hz, int ms)
 #define WAKE_MAX_BYTES   (AUDIO_RATE_HZ * BYTES_PER_SAMPLE * WAKE_MAX_MS / 1000)
 
 static audio_clip_cb_t s_clip_cb;
-static volatile bool   s_wake_paused = true;
+static atomic_bool s_wake_paused = true;
+static atomic_uint s_wake_generation;
 static uint8_t *s_wake_buf;
 
 static int frame_rms(const int16_t *p, size_t n)
@@ -219,14 +273,29 @@ static void wake_task(void *arg)
     bool collecting = false;
     int max_rms = 0;            /* 诊断：每秒打印最大 RMS，便于标定阈值 */
     int diag_ms = 0;
+    uint32_t generation = atomic_load(&s_wake_generation);
 
     while (1) {
-        if (s_wake_paused || !s_wake_buf) {
+        if (s_recording || !s_wake_buf) {
             vTaskDelay(pdMS_TO_TICKS(50));
             collecting = false;
             continue;
         }
+        xSemaphoreTake(s_mic_lock, portMAX_DELAY);
+        if (s_recording) {
+            xSemaphoreGive(s_mic_lock);
+            collecting = false;
+            continue;
+        }
         int ret = esp_codec_dev_read(s_mic, frame, fbytes);
+        xSemaphoreGive(s_mic_lock);
+        /* Keep draining RX during speech so reopening cannot capture buffered echo. */
+        if (s_wake_paused || s_recording || s_playing ||
+            generation != atomic_load(&s_wake_generation)) {
+            generation = atomic_load(&s_wake_generation);
+            collecting = false;
+            continue;
+        }
         if (ret != ESP_CODEC_DEV_OK) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -290,5 +359,6 @@ esp_err_t audio_wake_start(audio_clip_cb_t cb)
 
 void audio_wake_pause(bool pause)
 {
+    if (pause) atomic_fetch_add(&s_wake_generation, 1);
     s_wake_paused = pause;
 }

@@ -1,9 +1,11 @@
 #include "net.h"
 
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -23,12 +25,32 @@ static int  s_retry;
 static esp_websocket_client_handle_t s_ws;
 static net_msg_cb_t s_msg_cb;
 static net_tts_cb_t s_tts_cb;
-static volatile bool s_ws_up;
+static atomic_bool s_ws_up;
+static SemaphoreHandle_t s_audio_tx_lock;
+static atomic_uint s_speech_generation;
+static atomic_uint s_upload_generation;
+static uint32_t s_tts_generation;
+static net_speech_t s_tts_speech;
 
 /* 主机 TTS 音频接收缓冲（PSRAM） */
 static uint8_t *s_tts_buf;
 static size_t   s_tts_need;
 static size_t   s_tts_got;
+
+void net_discard_speech(void)
+{
+    atomic_fetch_add(&s_speech_generation, 1);
+}
+
+uint32_t net_speech_generation(void)
+{
+    return atomic_load(&s_speech_generation);
+}
+
+void net_cancel_audio_uploads(void)
+{
+    atomic_fetch_add(&s_upload_generation, 1);
+}
 
 void net_set_tts_cb(net_tts_cb_t cb)
 {
@@ -100,15 +122,18 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
             char hello[320];   /* hello JSON 约 200 字节，别截断 */
             snprintf(hello, sizeof(hello),
                      "{\"v\":\"1\",\"t\":\"hello\",\"token\":\"%s\",\"device_id\":\"ds-bot\","
-                     "\"fw\":\"0.1.0\",\"audio\":{\"codec\":\"pcm_s16le\",\"rate\":16000,"
+                     "\"fw\":\"0.2.0\",\"audio\":{\"codec\":\"pcm_s16le\",\"rate\":16000,"
                      "\"channels\":1,\"bits\":16}}",
                      CONFIG_DSBOT_BRIDGE_TOKEN);
             esp_websocket_client_send_text(s_ws, hello, strlen(hello), pdMS_TO_TICKS(2000));
         }
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
+    case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_FINISH:
         ESP_LOGW(TAG, "websocket disconnected");
         s_ws_up = false;
+        net_discard_speech();
         if (s_tts_buf) { free(s_tts_buf); s_tts_buf = NULL; s_tts_need = s_tts_got = 0; }
         break;
     case WEBSOCKET_EVENT_DATA:
@@ -124,8 +149,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                     size_t len = s_tts_got;
                     s_tts_buf = NULL; s_tts_need = s_tts_got = 0;
                     ESP_LOGI(TAG, "TTS 音频完整: %u 字节", (unsigned)len);
-                    if (s_tts_cb) {
-                        s_tts_cb(pcm, len);      /* 回调负责 free */
+                    if (s_tts_cb && s_tts_generation == net_speech_generation()) {
+                        s_tts_cb(pcm, len, s_tts_generation, &s_tts_speech); /* 回调负责 free */
                     } else {
                         free(pcm);
                     }
@@ -147,14 +172,30 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
                         if (cJSON_IsString(t)) {
                             type = t->valuestring;
                         }
+                        if (!strcmp(type, "stop_speak")) {
+                            net_discard_speech();
+                            free(s_tts_buf);
+                            s_tts_buf = NULL;
+                            s_tts_need = s_tts_got = 0;
+                        }
                         /* speak: 预留接收缓冲，等二进制帧填满后播放 */
                         if (!strcmp(type, "speak")) {
+                            memset(&s_tts_speech, 0, sizeof(s_tts_speech));
+                            cJSON *aid = cJSON_GetObjectItem(root, "audio_id");
+                            cJSON *seq = cJSON_GetObjectItem(root, "question_seq");
+                            cJSON *rid = cJSON_GetObjectItem(root, "request_id");
+                            if (cJSON_IsNumber(aid)) s_tts_speech.audio_id = (uint32_t)aid->valuedouble;
+                            if (cJSON_IsNumber(seq)) s_tts_speech.question_seq = (uint32_t)seq->valuedouble;
+                            if (cJSON_IsString(rid)) strlcpy(s_tts_speech.request_id, rid->valuestring,
+                                                            sizeof(s_tts_speech.request_id));
                             cJSON *bytes = cJSON_GetObjectItem(root, "bytes");
                             if (cJSON_IsNumber(bytes) && bytes->valueint > 0) {
                                 if (s_tts_buf) { free(s_tts_buf); }
                                 s_tts_need = (size_t)bytes->valueint;
                                 s_tts_got = 0;
+                                s_tts_generation = net_speech_generation();
                                 s_tts_buf = heap_caps_malloc(s_tts_need, MALLOC_CAP_SPIRAM);
+                                if (!s_tts_buf && s_tts_cb) s_tts_cb(NULL, 0, s_tts_generation, &s_tts_speech);
                                 ESP_LOGI(TAG, "准备接收 TTS 音频 %u 字节", (unsigned)s_tts_need);
                             }
                         }
@@ -183,6 +224,8 @@ static void ws_start(void)
              CONFIG_DSBOT_BRIDGE_HOST, CONFIG_DSBOT_BRIDGE_PORT);
     esp_websocket_client_config_t cfg = {
         .uri = uri,
+        /* Bridge shutdown sends CLOSE; also reconnect after a clean handshake. */
+        .enable_close_reconnect = true,
         .reconnect_timeout_ms = 3000,
         .network_timeout_ms = 8000,
         .buffer_size = 4096,
@@ -196,6 +239,8 @@ static void ws_start(void)
 esp_err_t net_start(net_msg_cb_t cb)
 {
     s_msg_cb = cb;
+    s_audio_tx_lock = xSemaphoreCreateMutex();
+    if (!s_audio_tx_lock) return ESP_ERR_NO_MEM;
     esp_err_t err = wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi 连接失败（SSID 配了吗？见 idf.py menuconfig → ds-bot 配置）");
@@ -216,7 +261,7 @@ esp_err_t net_send_json(const char *json)
         return ESP_ERR_INVALID_STATE;
     }
     int n = esp_websocket_client_send_text(s_ws, json, strlen(json), pdMS_TO_TICKS(3000));
-    return n < 0 ? ESP_FAIL : ESP_OK;
+    return n == (int)strlen(json) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t net_send_binary(const void *data, size_t len)
@@ -225,5 +270,56 @@ esp_err_t net_send_binary(const void *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
     int n = esp_websocket_client_send_bin(s_ws, (const char *)data, len, pdMS_TO_TICKS(3000));
-    return n < 0 ? ESP_FAIL : ESP_OK;
+    return n == (int)len ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t send_clip(const char *request_id, const char *mode,
+                           const void *data, size_t len, const char *answer_to, uint32_t question_seq)
+{
+    if (!s_audio_tx_lock || !request_id || !data || !len) return ESP_ERR_INVALID_STATE;
+    uint32_t generation = atomic_load(&s_upload_generation);
+    xSemaphoreTake(s_audio_tx_lock, portMAX_DELAY);
+    if (generation != atomic_load(&s_upload_generation)) {
+        xSemaphoreGive(s_audio_tx_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    char msg[384];
+    snprintf(msg, sizeof(msg),
+             "{\"v\":\"1\",\"t\":\"audio_start\",\"request_id\":\"%s\",\"mode\":\"%s\","
+             "\"answer_to\":\"%s\",\"question_seq\":%lu}",
+             request_id, mode ? mode : "task", answer_to ? answer_to : "", (unsigned long)question_seq);
+    esp_err_t err = net_send_json(msg);
+    const uint8_t *pcm = data;
+    for (size_t off = 0; err == ESP_OK && off < len; off += 4096) {
+        if (generation != atomic_load(&s_upload_generation)) {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        size_t n = len - off > 4096 ? 4096 : len - off;
+        err = net_send_binary(pcm + off, n);
+    }
+    if (err == ESP_OK && generation != atomic_load(&s_upload_generation)) err = ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK) {
+        snprintf(msg, sizeof(msg),
+                 "{\"v\":\"1\",\"t\":\"audio_end\",\"request_id\":\"%s\",\"mode\":\"%s\",\"duration_ms\":%u}",
+                 request_id, mode ? mode : "task", (unsigned)(len * 1000 / 32000));
+        err = net_send_json(msg);
+    }
+    if (err != ESP_OK) {
+        snprintf(msg, sizeof(msg), "{\"v\":\"1\",\"t\":\"audio_abort\",\"request_id\":\"%s\"}", request_id);
+        net_send_json(msg);
+    }
+    xSemaphoreGive(s_audio_tx_lock);
+    return err;
+}
+
+esp_err_t net_send_audio_clip(const char *request_id, const char *mode, const void *data, size_t len)
+{
+    return send_clip(request_id, mode, data, len, NULL, 0);
+}
+
+esp_err_t net_send_answer_clip(const char *clip_id, const char *request_id,
+                               uint32_t question_seq, const void *data, size_t len)
+{
+    return send_clip(clip_id, "answer", data, len, request_id, question_seq);
 }

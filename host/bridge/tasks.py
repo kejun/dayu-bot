@@ -17,11 +17,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable
 
+from .processes import ProcessCleanupError
+
 
 class State(str, Enum):
     RECORDING = "recording"
     PROCESSING = "processing"
     NEED_USER = "need_user"
+    CANCELLING = "cancelling"
     DONE = "done"
 
 
@@ -59,6 +62,7 @@ class Task:
     text: str = ""
     source: str = "voice"                   # voice | cron | text
     dedup_key: str | None = None
+    owner: str | None = None               # 提交终端；取消不能串到另一台设备
     state: State = State.PROCESSING
     question: str | None = None
     result_kind: ResultKind | None = None
@@ -69,6 +73,7 @@ class Task:
     cancel_requested: bool = False
     started: bool = False
     history: list[str] = field(default_factory=list)   # 用户补充的原文
+    question_seq: int = 0                 # 区分同一任务中的多轮追问
 
     # 内部
     answer_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -83,6 +88,7 @@ class Task:
             "request_id": self.request_id,
             "state": self.state.value,
             "question": self.question,
+            "question_seq": self.question_seq,
             "result": None if self.result_kind is None else {
                 "kind": self.result_kind.value,
                 "text": self.result_text,
@@ -108,6 +114,7 @@ class TaskManager:
         self._by_dedup: dict[str, Task] = {}
         self._queue: asyncio.Queue[Task] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
+        self._halted_reason: str | None = None
 
     # -- 生命周期 -----------------------------------------------------------
     def start(self) -> None:
@@ -125,7 +132,7 @@ class TaskManager:
 
     # -- 提交 ---------------------------------------------------------------
     def submit(self, request_id: str, text: str, *, source: str = "voice",
-               dedup_key: str | None = None) -> Task:
+               dedup_key: str | None = None, owner: str | None = None) -> Task:
         # 幂等：同一 request_id 直接返回已有任务，绝不重跑（PRD §5.3）
         if request_id in self._tasks:
             return self._tasks[request_id]
@@ -135,7 +142,8 @@ class TaskManager:
             if existing.state != State.DONE:
                 self._tasks[request_id] = existing
                 return existing
-        task = Task(request_id=request_id, text=text, source=source, dedup_key=dedup_key)
+        task = Task(request_id=request_id, text=text, source=source,
+                    dedup_key=dedup_key, owner=owner)
         self._tasks[request_id] = task
         if dedup_key:
             self._by_dedup[dedup_key] = task
@@ -143,9 +151,10 @@ class TaskManager:
         self._emit(task)
         return task
 
-    def answer(self, request_id: str, text: str) -> Task | None:
+    def answer(self, request_id: str, text: str, *, question_seq: int | None = None) -> Task | None:
         task = self._tasks.get(request_id)
-        if task is None or task.state != State.NEED_USER:
+        if (task is None or task.state != State.NEED_USER
+                or (question_seq is not None and task.question_seq != question_seq)):
             return None
         task.history.append(text)
         task.pending_answer = text
@@ -162,16 +171,18 @@ class TaskManager:
             return None
         if task.state == State.DONE:
             return task
+        if task.cancel_requested:
+            return task
         task.cancel_requested = True
         task.cancel_event.set()
         if not task.started:
             # 还没开始派发任何动作 → 干净取消
             task.state = State.DONE
             task.result_kind = ResultKind.CANCELLED
-            task.result_text = "已取消：本次未向手机派发任何动作。"
+            task.result_text = "任务已经取消。本次未向手机派发任何动作。"
         else:
             # 已开始执行：只能停止后续动作，不能撤销已发生的操作
-            task.result_text = "已取消后续动作；此前已执行的操作不会自动撤销。"
+            task.state = State.CANCELLING
         task.touch()
         # 唤醒可能正等回答的 worker，否则它不会察觉取消
         task.answer_event.set()
@@ -180,6 +191,18 @@ class TaskManager:
 
     def get(self, request_id: str) -> Task | None:
         return self._tasks.get(request_id)
+
+    def unfinished(self, owner: str | None = None) -> list[Task]:
+        """返回未结束任务；去掉 dedup 别名，保持提交顺序。"""
+        seen: set[str] = set()
+        result = []
+        for task in self._tasks.values():
+            if task.request_id in seen or task.state == State.DONE:
+                continue
+            seen.add(task.request_id)
+            if owner is None or task.owner == owner:
+                result.append(task)
+        return result
 
     def snapshot(self) -> list[dict]:
         return [t.to_dict() for t in self._tasks.values()]
@@ -192,10 +215,18 @@ class TaskManager:
                 await self._process(task)
             except asyncio.CancelledError:
                 raise
+            except ProcessCleanupError as e:
+                self._halted_reason = str(e)
+                task.state = State.DONE
+                task.result_kind = ResultKind.UNKNOWN
+                task.result_text = "执行结束未确认，手机执行通道已暂停。请检查主机和手机后重启网关。"
+                task.touch()
+                self._emit(task)
             except Exception as e:  # noqa: BLE001
                 task.state = State.DONE
-                task.result_kind = ResultKind.FAILED
-                task.result_text = f"执行出错：{e}"
+                task.result_kind = ResultKind.UNKNOWN if task.cancel_requested else ResultKind.FAILED
+                task.result_text = (f"取消未确认，请核对手机状态：{e}" if task.cancel_requested
+                                    else f"执行出错：{e}")
                 task.touch()
                 self._emit(task)
             finally:
@@ -203,6 +234,13 @@ class TaskManager:
 
     async def _process(self, task: Task) -> None:
         if task.state == State.DONE:      # 入队后已被取消
+            return
+        if self._halted_reason:
+            task.state = State.DONE
+            task.result_kind = ResultKind.FAILED
+            task.result_text = "手机执行通道已暂停，本次未派发动作。请检查主机进程后重启网关。"
+            task.touch()
+            self._emit(task)
             return
         task.started = True
         while True:
@@ -213,6 +251,7 @@ class TaskManager:
             if turn.is_question:
                 task.state = State.NEED_USER
                 task.question = turn.text
+                task.question_seq += 1
                 task.touch()
                 self._emit(task)
                 await task.answer_event.wait()
@@ -238,7 +277,7 @@ class TaskManager:
             task.evidence = turn.evidence
         else:
             task.result_kind = ResultKind.CANCELLED
-            task.result_text = task.result_text or "已取消后续动作；已执行的操作不会自动撤销。"
+            task.result_text = "任务已经取消。已经发给手机的操作可能仍会完成，无法自动撤销，请核对实际结果。"
         task.touch()
         self._emit(task)
 

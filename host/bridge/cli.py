@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-from .agent import Agent, PHONE_PREAMBLE, parse_reply
+from .agent import AgentError, make_agent, phone_prompt, parse_reply
 from .config import Config, HOST_DIR
 from .ictrl import IctrlClient, IctrlError
 
@@ -31,8 +31,8 @@ def cmd_doctor(cfg: Config, args) -> int:
     print("== 环境检查 ==")
     ok = True
 
-    avail, info = Agent(cfg.hermes_bin).available()
-    print(f"[{'OK' if avail else '!!'}] Agent ({cfg.hermes_bin}): {info}")
+    avail, info = make_agent(cfg).available()
+    print(f"[{'OK' if avail else '!!'}] Agent ({cfg.agent_backend}): {info}")
     ok &= avail
 
     print(f"[{'OK' if cfg.ictrl_client.exists() else '!!'}] iCTRL 客户端: {cfg.ictrl_client}")
@@ -43,15 +43,21 @@ def cmd_doctor(cfg: Config, args) -> int:
     print(f"[{'OK' if healthy else '!!'}] iCTRL ({cfg.ictrl_host}): {msg}")
     ok &= healthy
 
-    print(f"[..] Hermes skill 目标目录: {HERMES_SKILL_DIR}")
-    print(f"[{'OK' if (HERMES_SKILL_DIR / 'SKILL.md').exists() else '..'}] "
-          f"iCTRL skill 已安装: {(HERMES_SKILL_DIR / 'SKILL.md').exists()}")
+    if cfg.agent_backend == "hermes":
+        skill = HOST_DIR / "skills" / "ictrl-phone-control" / "SKILL.md"
+        print(f"[{'OK' if skill.exists() else '!!'}] 项目 iCTRL skill: {skill}")
+        ok &= skill.exists()
 
-    from .speech import WhisperCpp
-    stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
+    from .speech import QwenAsr
+    stt = QwenAsr.from_config(cfg)
     sok, swhy = stt.available()
-    print(f"[{'OK' if sok else '!!'}] 语音识别 (whisper.cpp): {swhy}")
+    print(f"[{'OK' if sok else '!!'}] 语音识别 (千问云端): {swhy}")
     ok &= sok
+
+    from .tts import QwenTts
+    tok_, twhy = QwenTts.from_config(cfg).available()
+    print(f"[{'OK' if tok_ else '!!'}] 语音合成 (千问云端): {twhy}")
+    ok &= tok_
 
     print("== 结论:", "全部就绪" if ok else "有未就绪项，见上面 !! ==")
     return 0 if ok else 1
@@ -83,14 +89,29 @@ def cmd_phone(cfg: Config, args) -> int:
 
 def cmd_ask(cfg: Config, args) -> int:
     """阶段 1：纯文字驱动 Agent + iCTRL，无需 ESP32。"""
-    agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout,
-                  args=args.hermes_args or cfg.hermes_args)
-    if not agent.available()[0]:
-        print("找不到 Hermes，可设 HERMES_BIN", file=sys.stderr)
+    agent = make_agent(cfg, args.hermes_args)
+    ok, why = agent.available()
+    if not ok:
+        print(why, file=sys.stderr)
         return 1
-    prompt = PHONE_PREAMBLE.format(host=cfg.ictrl_host) + f"\n\n用户指令：{args.text}"
-    print(f"[agent] 交给 Hermes 执行，手机={cfg.ictrl_host} …")
-    res = asyncio.run(agent.ask(prompt))
+    prompt = phone_prompt(agent, cfg.ictrl_host, args.text)
+    print(f"[agent] 后端={cfg.agent_backend}，手机={cfg.ictrl_host} …")
+    try:
+        async def run():
+            try:
+                if cfg.agent_backend == "direct":
+                    return await agent.ask(prompt, original=args.text)
+                return await agent.ask(prompt)
+            finally:
+                if hasattr(agent, "aclose"):
+                    await agent.aclose()
+        res = asyncio.run(run())
+    except AgentError as exc:
+        print(f"Agent 调用失败：{exc}", file=sys.stderr)
+        return 1
+    if res.returncode != 0:
+        print("Agent 调用失败，请检查项目 .runtime 中的日志", file=sys.stderr)
+        return 1
     turn = parse_reply(res.text)
     print("\n== 结果 ==")
     if turn.is_question:
@@ -117,23 +138,47 @@ def cmd_install_skill(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_plan(cfg: Config, args) -> int:
+    """Normalize an instruction without dispatching any phone request."""
+    from .direct import DirectAgent
+    async def run():
+        agent = DirectAgent(cfg)
+        try:
+            return await agent.normalize(args.text)
+        finally:
+            await agent.aclose()
+    try:
+        print(json.dumps(asyncio.run(run()), ensure_ascii=False, indent=2))
+        return 0
+    except AgentError as exc:
+        print(f"任务整理失败：{exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_serve(cfg: Config, args) -> int:
     import logging
     from .server import Bridge
-    from .speech import WhisperCpp
+    from .speech import QwenAsr
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    agent = Agent(cfg.hermes_bin, timeout=cfg.agent_timeout,
-                  args=args.hermes_args or cfg.hermes_args)
-    stt = WhisperCpp(cfg.stt_model, cfg.stt_binary, cfg.stt_language)
+    agent = make_agent(cfg, args.hermes_args)
+    aok, awhy = agent.available()
+    print(f"千问模型: {'OK' if aok else '不可用'} — {awhy}")
+    stt = QwenAsr.from_config(cfg)
     ok, why = stt.available()
     print(f"语音识别: {'OK' if ok else '不可用'} — {why}")
-    from .tts import SayTts
-    say = SayTts()
+    if not aok or not ok:
+        print("请补全项目 .env 后重新启动 Bridge。", file=sys.stderr)
+        return 1
+    from .tts import QwenTts
+    say = QwenTts.from_config(cfg)
     tok_, twhy = say.available()
     print(f"语音合成: {'OK' if tok_ else '不可用'} — {twhy}")
-    bridge = Bridge(cfg, agent, _client(cfg), stt=stt if ok else None,
-                    say=say if tok_ else None)
+    if not tok_:
+        print("请补全项目 .env 中的千问 TTS 配置后重新启动 Bridge。", file=sys.stderr)
+        return 1
+    bridge = Bridge(cfg, agent, _client(cfg), stt=stt,
+                    say=say)
     print(f"网关监听 ws://{cfg.bind}:{cfg.port}  手机={cfg.ictrl_host}")
     try:
         asyncio.run(bridge.serve_forever())
@@ -166,6 +211,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("text")
     sp.add_argument("--hermes-args", nargs="*", default=None)
     sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("plan", help="仅整理任务规范，不操作手机")
+    sp.add_argument("text")
+    sp.set_defaults(func=cmd_plan)
 
     sub.add_parser("install-skill", help="安装 iCTRL skill 到 Hermes").set_defaults(
         func=cmd_install_skill)

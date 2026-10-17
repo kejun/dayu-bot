@@ -8,8 +8,11 @@ version = "0.1.0"
 description = "Host-side connector: ESP32 voice terminal -> Hermes Agent -> iCTRL (iPhone)"
 requires-python = ">=3.10"
 dependencies = [
-    "websockets>=12",
+    "websockets>=14",      # native async cloud TTS, cancellable WebSocket requests
     "cryptography>=42",   # iCTRL LAN pairing (X25519)
+    "psutil>=5.9",        # track Agent subprocess identities and detached tools
+    "httpx[socks]>=0.27", # cancellable Qwen ASR; supports existing proxy environments
+    "python-dotenv>=1.0", # project .env configuration
 ]
 
 [project.scripts]

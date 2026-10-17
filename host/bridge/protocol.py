@@ -13,6 +13,7 @@ class Msg:
     AUDIO_END = "audio_end"
     AUDIO_ABORT = "audio_abort"
     ANSWER = "answer"
+    SPEAK_DONE = "speak_done"
     CANCEL = "cancel"
     MUTE = "mute"
     PING = "ping"
@@ -22,6 +23,8 @@ class Msg:
     QUESTION = "question"
     RESULT = "result"
     SPEAK = "speak"
+    STOP_SPEAK = "stop_speak"
+    LISTEN = "listen"
     NOTICE = "notice"
     PONG = "pong"
 
@@ -47,8 +50,9 @@ def status(request_id: str, state: str) -> str:
     return _msg(Msg.STATUS, request_id=request_id, state=state)
 
 
-def question(request_id: str, text: str, expect: str = "audio") -> str:
-    return _msg(Msg.QUESTION, request_id=request_id, text=text, expect=expect)
+def question(request_id: str, text: str, expect: str = "audio", question_seq: int | None = None) -> str:
+    return _msg(Msg.QUESTION, request_id=request_id, text=text, expect=expect,
+                **({"question_seq": question_seq} if question_seq is not None else {}))
 
 
 def result(request_id: str, kind: str, text: str, evidence: dict | None = None) -> str:
@@ -56,8 +60,18 @@ def result(request_id: str, kind: str, text: str, evidence: dict | None = None) 
                 evidence=evidence or {})
 
 
-def speak(audio_id: int, text: str = "", fmt: str = "pcm_s16le", nbytes: int = 0) -> str:
-    return _msg(Msg.SPEAK, audio_id=audio_id, text=text, format=fmt, bytes=nbytes)
+def speak(audio_id: int, text: str = "", fmt: str = "pcm_s16le", nbytes: int = 0,
+          *, request_id: str | None = None, question_seq: int | None = None) -> str:
+    target = {"request_id": request_id, "question_seq": question_seq} if request_id else {}
+    return _msg(Msg.SPEAK, audio_id=audio_id, text=text, format=fmt, bytes=nbytes, **target)
+
+
+def listen(request_id: str, question_seq: int) -> str:
+    return _msg(Msg.LISTEN, request_id=request_id, question_seq=question_seq)
+
+
+def stop_speak() -> str:
+    return _msg(Msg.STOP_SPEAK)
 
 
 def notice(level: str, text: str) -> str:

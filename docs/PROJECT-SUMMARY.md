@@ -1,196 +1,136 @@
-# Mini Agent Assistant —— 项目总结与踩坑记录
+# Mini Agent Assistant：项目总结与排错记录
 
-> 版本：2026-10-17
-> 项目路径：`/Users/haoyu/dayu-dot`
-> 一句话：**对 ESP32 语音终端说话 → 主机 Agent 理解 → iCTRL 操作 iPhone → 结果回传显示/播报**
+更新：**2026-10-17**。本文以当天代码、配置和本机验证记录为准。当前入口见 [README](../README.md)，协议细节见[终端协议](protocol-v1.md)，历史安装记录位于本文后半部分及 [iCTRL 文档](ictrl-setup.md)。
 
----
+## 当前产品与架构
 
-## 1. 产品目标（来自 PRD v1.2）
+对 ESP32 说出手机任务，Mac 上的 Bridge 调用千问完成识别、意图整理和逐步执行，通过 iCTRL 操作真实 iPhone App，再把问题或结果交给千问 TTS，在 ESP32 播放。
 
-核心闭环只有一条：
-
-```
-用户说话 → ESP32 采集语音 → 主机 Agent 理解任务 → iCTRL 操作 iPhone → ESP32 显示/播报结果
-```
-
-**关键约束**：
-- 微信、邮件**不是独立业务模块**，统一通过 **iCTRL 操作手机 App** 完成。
-- 不引入 Gmail API / IMAP / 邮箱授权页 / 自研 Agent Runtime / 独立调度器 / 插件平台。
-- 复用现有 Agent（Hermes）、现有调度（`hermes cron`）、现有技能体系。
-- 主机 Agent 长期无人值守操作手机；结果必须**如实**（"结果未确认" ≠ "成功"）。
-
----
-
-## 2. 最终架构
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Mac（主机）                                │
-│                                                                   │
-│  ESP32-S3 ──WiFi(ws://192.168.1.13:8765/ws)──► host/bridge        │
-│  (语音/状态)                                    ├─ whisper.cpp STT │
-│                                                 ├─ macOS say TTS   │
-│                                                 ├─ 任务串行闸门     │
-│                                                 └─ hermes -z ──┐   │
-│                                                                 │   │
-│                                       ┌─────────────────────────┘   │
-│                                       ▼                             │
-│                                  iCTRL JSON-RPC :8200               │
-└───────────────────────────────────────┼─────────────────────────────┘
-                                        ▼
-                              iPhone（XCUITest runner）
+```text
+ESP32 PCM → Bridge / Qwen ASR → 串行任务队列
+                                     ↓
+                             整理并校验任务规范
+                                     ↓
+                          Bridge / 千问工具调用循环
+                                     ↓
+                    iCTRL worker → 加密 JSON-RPC → iPhone
+                                     ↓
+                       核验结果 / 追问 → Qwen TTS → ESP32
 ```
 
-**数据流（语音指令）**：
+默认后端为 `direct`，不在每次任务中启动 Hermes CLI。Hermes 保留为可选后端，原有 cron 接入尚未完成。微信、邮件、外卖都通过手机 App 界面完成，没有新增业务专用接口。
 
-```
-按住物理键 或 说「小弟小弟」
-  → ESP32 录 16kHz/单声道/16bit PCM
-  → WebSocket 二进制帧上传
-  → 主机 whisper.cpp 识别成文字（简体）
-  → 任务闸门（串行/去重/取消）
-  → hermes -z -t terminal --skills ictrl-phone-control --yolo "<指令>"
-  → Hermes 调 iCTRL 客户端操作 iPhone
-  → DONE: success|failed|cancelled|unknown; <结果>
-  → 结果回传 ESP32（精灵表情 + 中文标签）+ macOS say 语音播报
-```
+## 今天完成的改动
 
----
-
-## 2.1 端到端链路现状（逐环节验证状态）
-
-> 截至 2026-10-17。这是**实际验证过的程度**，不是设计意图。
-
-| # | 环节 | 状态 | 实测证据 |
-|---|---|---|---|
-| 1 | ESP32 麦克风采集（ES7210） | ✅ | `recording stop: 141312 bytes (4.42s) peak=32767 rms=728` |
-| 2 | 空闲 VAD 采集（唤醒用） | 🟡 | `wake: 检测到语音 (rms=2500)`；阈值在调 |
-| 3 | WiFi 连接 | ✅ | `ds-bot-net: got ip: 192.168.1.15` |
-| 4 | WebSocket 握手（协议 v1） | ✅ | `rx: {"t":"welcome",...}`；连接跨 ping 周期稳定 |
-| 5 | 音频上传 | ✅ | `uploaded 141312 bytes, rid=r3` |
-| 6 | 主机 STT（whisper.cpp） | ✅ | `STT 结果: '看看手机现在在哪个界面。'`（简体正确） |
-| 7 | 任务闸门（串行/去重/取消） | ✅ | `host/tests/test_tasks.py` **7 项单测通过** |
-| 8 | Hermes Agent | ✅ | 优化后**同一任务 10.4s**（之前 300s 超时） |
-| 9 | iCTRL 操作 iPhone | ✅ | `page_source` 返回界面树；文字路径完成微信发送 |
-| 10 | 结果回传 ESP32 | ✅ | `rx: {"t":"result","kind":"success",...}` |
-| 11 | 精灵表情 + 中文标签 | ✅ | 屏幕可见（6 组表情随状态切换） |
-| 12 | 语音播报（TTS） | ✅ | `准备接收 TTS 音频 65884 字节` → `播放主机语音` |
-| 13 | 唤醒词「小弟小弟」 | 🟡 | **通路全通**（VAD→上传→识别→应答→亮屏），**识别准确率待调** |
-| 14 | 追问 / 取消 | ⬜ | 代码已实现（含单测），**未在真机上实测** |
-| 15 | 定时任务（`hermes cron`） | ⬜ | 未接入 |
-| 16 | 桌宠动画 | ⬜ | 未接入 |
-
-### 完成度（按 PRD §8 开发顺序）
-
-| PRD 阶段 | 完成度 | 说明 |
-|---|---|---|
-| **1. 主机文字指令驱动 Agent + iCTRL** | 🟡 **约 80%** | 微信发送验收通过；邮件查看、追问、取消未实测 |
-| **2. ESP32 录音/播放/联网** | ✅ **约 95%** | 显示/触摸/音频/按键/联网全部验证；唤醒词精度待调 |
-| **3. 串起语音 + Agent + 手机** | 🟡 **约 70%** | 文字路径端到端已通；**语音路径**（唤醒→指令）在调 |
-| **4. 追问、取消、最少状态** | 🟡 **约 30%** | 状态机/协议/单测已就绪，真机未验 |
-| **5. 桌宠 + 现成调度** | ⬜ **0%** | 未开始 |
-
-### 当前「在线」的组件（实时状态）
-
-| 组件 | 位置 | 状态 |
-|---|---|---|
-| iCTRL runner | iPhone `192.168.1.6:8200` | ✅ `/schema` 200 |
-| DDI | iPhone | ✅ Cryptex 已挂 |
-| 后台串口记录器 | `~/.dayu/serial_logger.py` → `~/.dayu/logs/serial.log` | 需在烧录前停掉 |
-| bridge 网关 | Mac `192.168.1.13:8765` | ✅ 终端已连 |
-| ds-bot 固件 | ESP32-S3 | ✅ WiFi `192.168.1.15` |
-| Hermes skill | `~/.hermes/skills/phone-control/ictrl-phone-control/` | ✅ 已安装 |
-
-### 关键缺口（阻碍「完整跑通」的三件事）
-
-1. **UI 测试授权依赖 Mac**：runner 授权跟着 `xcodebuild` 会话，会话停一阵就失效（报 `Not authorized for performing UI testing actions`）→ 与「无人值守」目标冲突。
-2. **唤醒词准确率**：whisper 在短/噪片段上会幻觉；需精调 VAD 阈值/增益、屏蔽 TTS 回采，或改用专用 KWS。
-3. **语音路径未端到端实测**：文字路径（`bridge ask`）已验收，但「说一句话 → 手机执行 → 回传」这条**完整语音闭环**尚未跑通一次。
-
----
-
-## 3. 软硬件清单
-
-| 项 | 具体 |
+| 方面 | 当前实现 |
 |---|---|
-| 开发板 | Waveshare **ESP32-S3-Touch-AMOLED-2.16** |
-| 芯片 | ESP32-S3 (QFN56) rev v0.2，16MB Flash + 8MB Octal PSRAM |
-| 屏幕 | 2.16" 480×480 AMOLED，**CO5300** QSPI |
-| 触摸 | **CST9217/CST9220** 电容触摸（I2C） |
-| 音频 | **ES7210** ADC（麦克风）+ **ES8311** codec（扬声器） |
-| 电源/姿态 | **AXP2101** PMIC + QMI8658 IMU |
-| 物理键 | Key2=**GPIO0**、Key3=**GPIO18**、Key1=**PWRON**（接 AXP2101） |
-| iPhone | iPhone 13 mini（iPhone14,4），iOS 27.0.1，UDID `00008110-001C7C113A22801E` |
-| 主机 | MacBookPro18,1（M1 Pro），macOS 27.0.1 |
-| ESP-IDF | **v5.5.5**（`~/esp/esp-idf`） |
-| LVGL | 9.x（Waveshare BSP 带） |
-| Xcode | 27.1（构建 iCTRL runner） |
-| STT | **whisper.cpp** + `ggml-small.bin`（`~/.dayu/models/`） |
-| TTS | macOS `say -v Tingting` → ffmpeg → 16kHz PCM |
-| Agent | Hermes（`~/.local/bin/hermes`），模型 `deepseek-v4.1-flash` @ `opencode-go` |
+| 统一千问 | ASR、规划/执行模型、TTS 统一使用项目配置的千问服务；模型调用关闭思考 |
+| 默认执行路径 | Bridge 常驻 HTTP 连接，固定少量手机工具，省去 Hermes 启动和通用工具上下文 |
+| iCTRL 提速 | 本机 Runner 支持 `launch_mode:foreground`；打开与首次读屏、动作与后续读屏合并 |
+| 任务整理 | 纠错补全目标、根应用和入口、步骤、限制、假设及待确认项；回答后重新规划 |
+| 应用入口 | “淘宝闪购”默认淘宝内闪购；工具层核对应用身份，保留明确独立 App 指令 |
+| 计划格式修复 | 空辅助字段允许省略；关键错误最多修正一次，两次合计 8 秒请求预算 |
+| 语音确认 | 暂停原任务 → 说出问题 → 实际播放回执 → 开启收音 → ASR → 继续同一任务 |
+| 安全取消 | 任一录音键长按 2 秒或语音取消；丢弃旧音频与迟到转写，等待已派发调用收尾 |
+| 启动失败分类 | 明确应用启动拒绝不再误触发“需要重启网关”；真正未知的动作/清理仍保留保护 |
+| 长任务预算 | 每轮 3000 步、21600 秒；单次模型 30 秒、手机请求 8 秒保持短超时 |
+| 设备恢复 | 固件正常 WebSocket 关闭后重连；Bridge 和 Runner 已重启/恢复，固件已烧录 |
 
----
+## 当前配置与部署快照
 
-## 4. 仓库结构
+这是 2026-10-17 的本机记录，不是持续在线保证。以后以 `.env`、启动日志和 `bridge doctor` 为准。
 
-```
-dayu-dot/
-├── README.md
-├── docs/
-│   ├── architecture.md            # 架构
-│   ├── plan.md                    # 开发计划与验收清单
-│   ├── protocol-v1.md             # ESP32 ⇄ 主机 终端协议 v1
-│   ├── ictrl-setup.md             # iCTRL 安装 + 全部排错（很有价值）
-│   ├── reference-ictrl-SKILL.md   # iCTRL 官方 skill（参考）
-│   └── PROJECT-SUMMARY.md         # 本文档
-├── host/                          # 主机连接程序
-│   ├── pyproject.toml
-│   ├── vendor/ictrl_rpc.py        # iCTRL 官方 Python 客户端（未改动）
-│   ├── skills/ictrl-phone-control/SKILL.md
-│   ├── bridge/
-│   │   ├── config.py              # 配置（env + config.json）
-│   │   ├── ictrl.py               # iCTRL 封装（HTTP 层走 curl）
-│   │   ├── agent.py               # Hermes 适配 + ASK/DONE 解析
-│   │   ├── speech.py              # whisper.cpp STT
-│   │   ├── tts.py                 # macOS say TTS
-│   │   ├── tasks.py               # 任务串行闸门（核心业务逻辑）
-│   │   ├── protocol.py            # 协议 v1 消息构造
-│   │   ├── server.py              # WebSocket 网关
-│   │   └── cli.py                 # bridge doctor/pair/phone/ask/install-skill/serve
-│   └── tests/test_tasks.py        # 7 项单测
-└── firmware/ds-bot/               # ESP32 固件
-    ├── CMakeLists.txt / partitions.csv / sdkconfig.defaults
-    ├── main/
-    │   ├── main.c                 # UI 状态机 + PTT + 唤醒 + TTS 播放
-    │   ├── audio.c/.h             # ES7210/ES8311 + VAD 唤醒采集
-    │   ├── buttons.c/.h           # GPIO18/GPIO0 按键
-    │   ├── axp2101.c/.h           # 极简 AXP2101 驱动（PWRKEY 短按）
-    │   ├── net.c/.h               # WiFi + WebSocket 客户端
-    │   └── Kconfig.projbuild      # WiFi/主机/token 配置
-    ├── components/uface/          # U-Face 精灵素材 + 32px 中文字体
-    └── tools/
-        ├── build-uface-256.sh     # 生成 256px 精灵素材
-        └── build-cjk-font.sh      # 生成中文字体子集
-```
+| 项目 | 本机配置 / 已验证环境 |
+|---|---|
+| Bridge 后端 | `direct` |
+| 主模型 | `qwen3.8-flash`；代码/示例默认仍是 `qwen-flash` |
+| ASR | `qwen3-asr-flash`，云端接口，16kHz PCM 在内存中包装 WAV |
+| TTS | `qwen-audio-3.0-tts-flash`，当前音色 `longanfengyue`；代码/示例默认 `longanxiaoxin` |
+| 执行预算 | `QWEN_MAX_STEPS=3000`，`AGENT_TIMEOUT=21600` |
+| 规划预算 | 768 token / 8 秒，最多一次格式修正且共用预算 |
+| 单次请求 | 模型 30 秒、iCTRL 8 秒、ASR/TTS 各 15 秒 |
+| Bridge 地址 | 本机 `192.168.1.13:8765`，设备走 Wi-Fi WebSocket |
+| iPhone Runner | 本机测试地址 `192.168.1.6:8200`，健康接口返回 skill `1.98.12` |
+| Runner 源码 | 独立仓库 `/Users/haoyu/code/ictrl`，快速启动修改需单独构建部署 |
+| ESP32 | Waveshare ESP32-S3-Touch-AMOLED-2.16，16MB Flash / 8MB PSRAM |
+| 显示/音频 | CO5300 480×480、LVGL 9、ES7210 / ES8311、16kHz 单声道 16bit PCM |
+| 固件 | 握手版本 `0.2.0`，ESP-IDF 5.5.5 / Python 3.13 编译与烧录通过 |
 
----
+主机 `.env` 配置优先级低于已导出的环境变量和 `host/config.json`。Key、服务地址、Wi-Fi 密码和配对密钥不复制进文档；当前用户配置不会因示例默认值而被覆盖。
 
-## 5. 实施时间线
+## 用户交互
 
-| 阶段 | 内容 | 结果 |
+空闲时按住左右任一录音键说话、松开上传，或“小D 小D”唤醒后下达任务；中间键短按开关屏幕，触屏不触发录音。
+
+需要澄清或确认时，TaskManager 保持 `need_user` 并占用手机队列，精灵显示说话状态。设备实际播完问题、排空 I2S 语音尾部后发送 `speak_done`；主机核对任务、轮次、音频 ID 和设备归属，再发送 `listen`，精灵显示“请说话”。此时直接回答即可，无需再次唤醒。
+
+VAD 检测到停顿后上传回答，转写成功后继续原任务；为空或失败时重新收音，不能默认同意。新一轮问题增加 `question_seq`，迟到回答和旧回执不会串入下一轮。播放期间不收音，物理键长按仍可取消。
+
+当前设备 PTT 缓冲 10 秒，VAD 单段约 5 秒，静音 900 毫秒后提交；主机 60 秒接收上限不代表设备支持 60 秒连续录音。噪声、长句和自然停顿的体验仍需持续标定。
+
+取消时先清旧播报、阻止新动作，再等已派发调用返回。设备最终播报“任务已经取消”，并说明已发生的操作不能撤销；如果无法确认清理，保留 `unknown` 并暂停执行通道。结果已确认成功时不改报取消。
+
+## 实测范围与证据
+
+| 验证 | 结果 | 本机报告 |
 |---|---|---|
-| 1 | ESP32 开发环境（ESP-IDF v5.5.5 + 工具链） | ✅ |
-| 2 | **iCTRL 安装到 iPhone**（最长的一段，见 §6.B） | ✅ |
-| 3 | 主机 bridge 实现（任务闸门/Agent/iCTRL/协议） | ✅ |
-| 4 | 阶段 1 验收：文字指令驱动 Agent + iCTRL | ✅ 微信发送跑通 |
-| 5 | ds-bot 固件：显示 → 精灵 → 字体 → 触摸 → 音频 → 按键 → 联网 | ✅ |
-| 6 | TTS 语音播报 + 唤醒词「小弟小弟」 | 🟡 通路通，唤醒识别在调 |
-| 7 | 定时任务（`hermes cron`）、桌宠、验收用例 3–5 | ⬜ |
+| 语音读当前界面 | 真实 Bridge / ASR / 模型 / 手机，4.86 秒返回结果 | `.runtime/direct-e2e-report.json` |
+| 语音打开淘宝并读屏 | 同链路 7.88 秒 | `.runtime/direct-open-report.json` |
+| 执行期间语音取消 | 上传取消录音后 0.365 秒收到取消结果 | `.runtime/direct-voice-cancel-report.json` |
+| 淘宝内闪购入口 | 启动淘宝、进入闪购并读屏，23.46 秒，未进入完整选购 | `.runtime/intent-entry-report.json` |
+| 当前页面快捷整理 | 3.74 秒，额外规划模型调用为 0 | `.runtime/intent-fast-read-report.json` |
+| 计划字段兼容 / 自动修复 | 真实模型兼容验证通过；缺关键字段故障注入后 4.37 秒修复 | `.runtime/plan-compat-report.json`、`plan-repair-live-report.json` |
+| 明确应用拒绝后的通道恢复 | 应用普通失败后，下一次只读任务可成功 | `.runtime/launch-fix-report.json` |
+| 两轮设备语音确认 | 实体设备播报回执后，经麦克风接收“热的”“可以”，同一任务完成 | `.runtime/clarification-hardware-report.json` |
+| 正式模型与手机确认链路 | 问冷/热 → 麦克风回答“热的” → 原任务恢复，仅一次 `page_source` → 成功 | `.runtime/clarification-production-report.json` |
+| 千问 TTS 设备播放 | 原生 PCM 合成与设备接收播放通过 | `.runtime/qwen-tts-device-report.json` |
 
----
+表中耗时为相应测试记录口径，通常不含人说话、等待回答和结果播放。两轮确认使用测试 Agent 验证语音/设备状态；正式确认测试另外覆盖真实主模型和实体手机。报告与界面记录位于本地 `.runtime/`，不随 Git 分发。
 
-## 6. 踩坑记录（重点）
+同一 `qwen3.8-flash` 和同一前台页面的少量对照：Hermes 路径 10.58 秒，direct 2.64 / 2.53 秒。对同一已运行淘宝 App，启动加首次读屏从普通模式 3.77 / 1.78 秒变为快速模式 1.15 / 1.03 秒。完整记录在 `.runtime/backend-benchmark.json`、`launch-benchmark.json`；不能推断所有 App、冷启动或完整点单都会相同比例提速。
+
+本地主机回归为 **129 项通过、1 项可选 Hermes 联调跳过**：unittest 发现 121 项（120 通过、1 跳过），独立任务调度脚本 9 项通过。后续只修改执行预算时另有 direct / 千问配置 44 项通过。物理按键策略原生测试、固件构建和烧录通过。
+
+## 已知故障与今天的修复
+
+| 症状 | 已定位原因与处理 |
+|---|---|
+| 应用打开失败却播报重启网关 | 原生明确拒绝被归为未知；仅对方法、目标标识、错误码、固定拒绝消息完整匹配时按普通失败处理 |
+| “任务整理失败” | 模型省略空辅助字段被严格字段校验拒绝；允许安全默认值，保留关键校验，必要时有界修正一次 |
+| 问题播出后回答无效 | 旧语音分支只检查取消；已接入按任务与轮次绑定的回答通路 |
+| 播报结束与收音没有衔接 | 增加 `speak_done` / `listen`，不再用主机发送完成代替设备播放完成 |
+| 任务到 16 步中止 | 原 `QWEN_MAX_STEPS=16` 生效；已改 3000，并将每轮 180 秒放宽到 6 小时 |
+| 设备在 Bridge 重启后不恢复 | 正常 WebSocket CLOSE 也启用约 3 秒重连；进程重启后不自动重跑旧任务 |
+
+12:11 的咖啡任务 `w1af3b73f-6-cmd` 在回答“热的”后继续，确实在原第 16 步上限终止，未确认完成选购。提高预算后尚未把该完整任务重新验收为成功。
+
+## 待验收与下一步
+
+- 重新验证完整咖啡候选选择与结果核查；仅入口成功不代表点单完成，购物仍停在提交/付款之前。
+- 语音微信发送、邮件读取总结、长任务/大步数稳定性和复杂自然停顿。
+- 更系统的断网、Runner 授权失效、动作在途取消与恢复；已有单测/部分链路验证不能替代全部故障实机验收。
+- `hermes cron` 或其他既有调度接入同一 Bridge 任务路径；当前只是 TaskManager 具备串行与合并能力。
+- Runner 长期 UI 授权维持；当前依赖 Mac/Xcode 测试会话，尚无脱离 Mac 的长期运行验收。
+
+U-Face 精灵状态动画已经接入设备，不再属于“桌宠未开始”；独立电脑桌宠不在当前范围。
+
+## 维护入口与日志
+
+| 位置 | 用途 |
+|---|---|
+| [README](../README.md) | 配置与服务启动命令 |
+| [iCTRL 安装与恢复](ictrl-setup.md) | Runner 构建、授权恢复、配对和快速启动参数 |
+| [固件构建](../firmware/ds-bot/README.md) | ESP-IDF、设备配置、串口互斥和烧录后恢复记录器 |
+| `~/.dayu/logs/bridge.log` | ASR/TTS、模型阶段、手机 RPC、问题轮次和错误 |
+| `~/.dayu/logs/serial.log` | 固件状态、上传、播放回执、VAD 与按键 |
+| `~/.dayu/logs/ictrl-runner.log` | iPhone 测试会话 |
+| `.runtime/direct/<trace_id>/` | 原始任务、补充、计划候选、完整快照和 `events.jsonl` |
+
+重启 Bridge 先停止旧实例并等候安全退出，再启动新实例；不要依赖强杀后立即重跑未知手机动作。固件烧录先停对应串口记录器，完成后用带 `pyserial` 的 ESP-IDF Python 恢复。主机虚拟环境路径不要先解析到系统解释器，否则会绕过虚拟环境依赖。
+
+## 历史排错记录（2026-10-16 至 2026-10-17 早期）
+
+以下保留当时的工具、版本、网络与硬件故障。旧 Whisper / macOS `say` / Hermes 默认路径已被上文新实现替代；第三方版本和服务状态是当时记录，不能当作持续有效的安装建议。
 
 ### A. ESP32 / ESP-IDF
 
@@ -234,7 +174,7 @@ dayu-dot/
 
 ---
 
-### B. iCTRL 安装到 iPhone（本项目的最大坑区）
+### B. iCTRL 安装到 iPhone（历史排错）
 
 > 完整排错见 `docs/ictrl-setup.md`。这里只列根因。
 
@@ -274,7 +214,7 @@ dayu-dot/
 #### B6. runner 崩溃：`Library not loaded: @rpath/XCTest.framework/XCTest`
 - **第一层原因**：**DDI 没挂**（`/System/Developer/Library/Frameworks/XCTest.framework` 不存在）。
 - **第二层原因**：iOS 靠 **bundle id 的 `.xctrunner` 后缀**识别测试 runner 并注入 XCTest 环境；**isideload 把 team id 追加到末尾**（`...xctrunner.NBYSH5B496`），后缀被破坏 → 当成普通 App 启动 → 崩。
-- **结论**：**iLoader/isideload 这条路走不通**，必须用保留 bundle id 的方式。
+- **本机当次结论**：该重签名路线未跑通，最终采用保留 Runner 标识的 Xcode 路线。
 
 #### B7. ✅ 最终成功路线：Xcode
 ```bash
@@ -332,7 +272,7 @@ xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
 - **根因**：CLI 的 `--name` 默认 `None` → JSON 里是 `"client_name": null`。
 - **解决**：默认用主机名 `os.uname().nodename`。
 
-#### C3. Hermes agent 慢到 300 秒超时
+#### C3. 旧 Hermes 默认路径慢到 300 秒超时（当前已改用 direct）
 - **现象**：一句话任务跑 5 分钟超时；`API call failed after 3 retries: Request timed out`。
 - **根因**：`hermes prompt-size` 显示每次调用带 **~70KB** 上下文：
   ```
@@ -346,7 +286,7 @@ xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
   → 工具 21→2 个、skill 索引 133→1 个，**同一任务 300s 超时 → 10.4s**。
 - ⚠️ **参数顺序**：`-z` 后面紧跟 prompt，其他参数要放在 `-z` **之前**（否则 argparse 报 "expected one argument"）。
 
-#### C4. `'WhisperCpp' object is not callable`
+#### C4. 旧 Whisper 接口的 `'WhisperCpp' object is not callable`（当前已移除）
 - **根因**：把 STT **对象**直接传给了 Bridge，但它需要**可调用对象**。
 - **解决**：给 `WhisperCpp` 加 `__call__`。
 
@@ -437,158 +377,10 @@ xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
 - **对照实验**：**干净的「小弟小弟」whisper 完全认得出**（连 1 秒截断都行）→ 问题在**音频质量**。
 - **相关**：麦克风增益 36dB 导致**削顶**（PTT 录音 `peak=32768`）；VAD 阈值过低会把环境噪声当语音。
 - **标定数据**：安静时 `rms≈94`，有声音时 `rms≈2500`。
-- **待办**：阈值/增益精调、加 pre-roll、唤醒期间屏蔽 TTS 回采。
+- **截至 2026-10-17**：已切换千问 ASR，播放期间暂停语音并持续排空麦克风缓冲；噪声环境标定和 pre-roll 仍待改进。
 
 #### D11. `audio_wake_start` 静默失败
 - **根因**：它在 `audio_init()` **之前**被调用，此时没有 mic 句柄 → 返回 `ESP_ERR_INVALID_STATE`，**不打日志**。
 - **教训**：初始化顺序很重要；关键初始化失败要打日志。
 
 ---
-
-## 7. 关键命令备忘
-
-### ESP32 固件
-
-```bash
-export PATH="$HOME/.idf-python:$PATH"          # python3 → 3.13
-. ~/esp/esp-idf/export.sh
-cd ~/dayu-dot/firmware/ds-bot
-export SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.local"
-
-pkill -f serial_logger.py                       # ⚠️ 烧录前必须先停记录器
-idf.py build
-idf.py -p /dev/cu.usbmodem101 flash
-```
-
-### 主机 bridge
-
-```bash
-cd ~/dayu-dot/host
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-export no_proxy="localhost,127.0.0.1,192.168.1.0/24,*.local"
-export ICTRL_HOST=192.168.1.6:8200
-
-./.venv/bin/python -m bridge.cli doctor        # 自检
-./.venv/bin/python -m bridge.cli pair --host 192.168.1.6:8200
-./.venv/bin/python -m bridge.cli install-skill
-./.venv/bin/python -m bridge.cli ask "打开手机微信，给大宇发送：哈喽"
-BRIDGE_TOKEN=<token> ./.venv/bin/python -u -m bridge.cli serve    # 网关
-```
-
-### iCTRL runner（手机需 USB）
-
-```bash
-cd ~/code/ictrl
-xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
-  -derivedDataPath build -destination "id=00008110-001C7C113A22801E" -allowProvisioningUpdates
-```
-
-### 手机侧诊断
-
-```bash
-cd ~/.ictrl/bin
-python3 ictrl_local.py --host 192.168.1.6:8200 call device_info
-python3 ictrl_local.py --host 192.168.1.6:8200 call reset     # UI 通道卡住时
-python3 ictrl_local.py --host 192.168.1.6:8200 call logs '{"max_elements":15}'
-```
-
----
-
-## 8. 当前状态（2026-10-17）
-
-### 已完成
-
-| 环节 | 状态 |
-|---|---|
-| ESP-IDF 环境 | ✅ v5.5.5 + 工具链 + Python 3.13 |
-| iPhone iCTRL | ✅ 运行中（Xcode 构建，bundle id 以 `.xctrunner` 结尾）|
-| DDI | ✅ 已挂（Cryptex，afcclient 直写容器）|
-| Remote Access | ✅ `192.168.1.6:8200` |
-| bridge 配对 + skill | ✅ `tok` 已缓存，skill 已装进 Hermes |
-| 阶段 1 验收用例 1 | ✅ 文字路径：给「大宇」发「哈喽」并截图核查 |
-| ds-bot 显示 | ✅ CO5300 AMOLED + LVGL 9 |
-| U-Face 精灵 | ✅ 6 组表情 / 18 帧 / 256px |
-| 中文字体 | ✅ 32px 子集 |
-| 触摸 | ✅ CST9217/9220（按用户要求已取消屏幕录音）|
-| 音频 | ✅ ES7210 麦克风 + ES8311 扬声器（回放可听清）|
-| 物理键 | ✅ GPIO18/GPIO0 按住说话；中间键短按开关屏幕 |
-| 联网 | ✅ WiFi + WebSocket（协议 v1）握手稳定 |
-| STT | ✅ whisper.cpp（`ggml-small`，简体）|
-| TTS | ✅ macOS `say` → ESP32 播放 |
-| 唤醒词通路 | 🟡 「小弟小弟」→ 应答 + 亮屏，**识别准确率在调** |
-
-### 未完成 / 待办
-
-- ⬜ **唤醒词识别准确率**（VAD 阈值/增益/回采屏蔽）
-- ⬜ **UI 授权持久化**（目前依赖 Mac 的 `xcodebuild` 测试会话）
-- ⬜ 阶段 1 验收用例 2–5（邮件查看、追问、取消、断线、定时任务）
-- ⬜ 阶段 2–5（ESP32 语音闭环实测、追问取消、桌宠、`hermes cron`）
-- ⬜ 定时任务接入（PRD §6）
-- ⬜ 桌宠动画（PRD §5.1，用 `hermes pets`）
-
----
-
-## 9. 经验教训
-
-### 方法论
-
-1. **先量后调**：内存不足就 `heap_caps_get_free_size` 打点；模型慢就 `hermes prompt-size`；音频不识别就先量 RMS 和存片段离线分析。**别猜**。
-2. **串口/日志要"常驻读取"**：没人读时日志会丢——起后台记录器。
-3. **对照实验定位**：`curl` 通而 `python` 不通 → 锁定进程级权限；直接给命令 25s vs 读 skill 300s → 锁定上下文过大。
-4. **读原理图/源码而不是猜**：中间键是 PWRON（不是 GPIO）就是靠读原理图 KEYS 区确认的；AXP2101 的寄存器位是从 `XPowersLib` 找到的。
-5. **官方 issue/PR 是最好的文档**：SideStore 的 `-80045`/`503` 根因和修复值都来自 issue #1657 的 diff。
-
-### 具体教训
-
-6. **代理是万恶之源**：Apple 认证、GitHub 下载、anisette 服务器——都被 Clash 代理坑过。涉及 Apple/局域网时优先**直连**。
-7. **macOS 的隐私权限**会拦非系统二进制的局域网访问，但放行 `curl`。
-8. **bundle id 的后缀有语义**：`.xctrunner` 决定 iOS 是否注入 XCTest；`.appex`/`.xctest` 必须是主 App id 的子前缀（isideload 的校验）。
-9. **LVGL 的坑**：字体是子集（要覆盖用到的标点区）、图片画布有透明边距（精灵显小）、`use_psram` 之外的 IRAM 选项会吃内部 RAM。
-10. **初始化顺序**：`nvs_flash_init` 必须在 WiFi 前；`audio_wake_start` 必须在 `audio_init` 后；关键初始化失败要打日志，否则静默失败极难查。
-11. **ESP32 的 USB-Serial/JTAG 与烧录工具互斥**：任何占着串口的后台进程都会让烧录失败。
-12. **别用转换头**：USB-A↔Type-C 转换头是"通电不通信"的经典元凶。
-
-### 架构性风险（需要正视）
-
-13. **UI 测试授权依赖 Mac**：iCTRL runner 的授权跟着 `xcodebuild` 会话，与 PRD 的"无人值守长期操作"目标冲突。这是**当前最需要解决的架构问题**。
-14. **本地 STT/TTS 的实时性**：whisper small 对短片段易幻觉；唤醒词最好用**专用 KWS**（ESP-SR WakeNet 需要向乐视定制「小弟小弟」模型）而不是通用 ASR。
-15. **Agent 的上下文成本**：LLM agent 的每次调用都带全部工具 schema + skill 索引；**限定工具集/预载 skill** 是必要的工程优化，不是可选。
-
----
-
-## 10. 快速上手（给下一个人）
-
-```bash
-# 1) 环境
-export PATH="$HOME/.idf-python:$PATH"; . ~/esp/esp-idf/export.sh   # ESP32
-cd ~/dayu-dot/host && ./.venv/bin/python -m bridge.cli doctor      # 主机自检
-
-# 2) 手机（需要时）
-#    - 确认 runner 在跑：curl http://192.168.1.6:8200/schema
-#    - 授权失效就重跑 xcodebuild test-without-building（手机插 USB）
-#    - DDI 丢了：iCTRL App → Settings → Runtime requirements → Re-mount
-
-# 3) 网关
-cd ~/dayu-dot/host
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-export no_proxy="localhost,127.0.0.1,192.168.1.0/24,*.local"
-BRIDGE_TOKEN=$(cat ~/.dayu/bridge_token) ICTRL_HOST=192.168.1.6:8200 \
-  ./.venv/bin/python -u -m bridge.cli serve
-
-# 4) 板子
-#    左/右键按住说话；中间键短按开关屏幕；说「小弟小弟」唤醒
-```
-
----
-
-## 11. 相关文档索引
-
-| 文档 | 内容 |
-|---|---|
-| `docs/architecture.md` | 架构与角色划分 |
-| `docs/plan.md` | 开发计划、验收清单、当前进度 |
-| `docs/protocol-v1.md` | 终端协议 v1（消息格式、去重、固定约定）|
-| `docs/ictrl-setup.md` | **iCTRL 安装 + 全部排错**（最有价值）|
-| `docs/reference-ictrl-SKILL.md` | iCTRL 官方 skill 原文 |
-| `firmware/ds-bot/README.md` | 固件构建/烧录/进度 |
-| 本文档 | 全局总结与踩坑记录 |

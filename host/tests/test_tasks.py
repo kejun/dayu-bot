@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 
@@ -141,6 +142,58 @@ async def test_coalesce_dedup_key():
     await tm.stop()
 
 
+async def test_cancel_waits_for_cleanup_before_finishing_or_next_task():
+    cleaning = asyncio.Event()
+    allow_exit = asyncio.Event()
+    started = []
+    emitted = []
+
+    async def runner(task):
+        started.append(task.request_id)
+        if task.request_id == "r1":
+            await task.cancel_event.wait()
+            cleaning.set()
+            await allow_exit.wait()
+            return Turn.done(ResultKind.CANCELLED, "stopped")
+        return Turn.done(ResultKind.SUCCESS, "ok")
+
+    tm = TaskManager(runner, lambda t: emitted.append((t.request_id, t.state)))
+    tm.start()
+    task = tm.submit("r1", "work")
+    tm.submit("r2", "next")
+    await _settle()
+    tm.cancel("r1")
+    tm.cancel("r1")
+    await cleaning.wait()
+    assert task.state == State.CANCELLING
+    assert started == ["r1"]
+    assert not any(rid == "r1" and st == State.DONE for rid, st in emitted)
+    allow_exit.set()
+    await _settle()
+    assert task.state == State.DONE and task.result_kind == ResultKind.CANCELLED
+    assert task.result_text.startswith("任务已经取消")
+    assert started == ["r1", "r2"]
+    assert sum(rid == "r1" and st == State.DONE for rid, st in emitted) == 1
+    await tm.stop()
+
+
+async def test_cancel_waiting_answer_releases_queue():
+    async def runner(task):
+        return Turn.question("谁？") if task.request_id == "r1" else Turn.done(ResultKind.SUCCESS, "ok")
+
+    tm = TaskManager(runner)
+    tm.start()
+    task = tm.submit("r1", "work")
+    next_task = tm.submit("r2", "next")
+    await _settle()
+    assert task.state == State.NEED_USER
+    tm.cancel("r1")
+    await _settle()
+    assert task.result_kind == ResultKind.CANCELLED
+    assert next_task.result_kind == ResultKind.SUCCESS
+    await tm.stop()
+
+
 def test_parse_reply():
     t = parse_reply("已发送。\nDONE: success; 已在张三的会话中发送")
     assert t.kind == ResultKind.SUCCESS
@@ -158,9 +211,9 @@ def test_parse_reply():
 
 def _run():
     fns = [v for k, v in sorted(globals().items())
-           if k.startswith(("test_",)) and asyncio.iscoroutinefunction(v)]
+           if k.startswith(("test_",)) and inspect.iscoroutinefunction(v)]
     sync = [v for k, v in sorted(globals().items())
-            if k.startswith("test_") and not asyncio.iscoroutinefunction(v)]
+            if k.startswith("test_") and not inspect.iscoroutinefunction(v)]
     for fn in sync:
         fn()
         print(f"  ok  {fn.__name__}")

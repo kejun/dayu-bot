@@ -1,71 +1,91 @@
-# iCTRL 安装与配对（iPhone 侧，一次性 + 每次重启）
+# iCTRL：安装、恢复与快速启动
 
-来源：`OpenMinis/iCTRL`。iCTRL 是跑在 iPhone 上的 XCUITest runner，
-对外提供 **JSON-RPC 2.0 over HTTP，端口 8200**，请求加密（X25519 配对 +
-HMAC-SHA256 信封）。`GET /skill` 是操作手册，`GET /schema` 是方法清单。
+更新：2026-10-17。本项目当前通过 **Xcode 构建和常驻测试会话**运行 iPhone Runner，主机使用加密 JSON-RPC 2.0 访问 `:8200`。下方 SideStore / iLoader 内容是历史排错记录，不代表当前验证路线。
 
-> ⚠️ 安全：iCTRL 把手机的完全控制权交给持有配对密钥的一方。
-> 仅在自有设备/账号上使用，只批准自己发起的配对，用完关闭远程访问。
-> 不要让它无人监管地接触支付、消息等不可撤销操作。
+## 当前部署边界
 
-## 前提（两件事都必须满足）
+Runner 源码位于独立仓库 **`/Users/haoyu/code/ictrl`**，不在本仓库中。今天增加的 `launch_mode:"foreground"` 需要构建并部署该仓库的修改，`skill_version` 相同不代表一定包含本机扩展。
 
-1. **能签名并安装 IPA**：免费 Apple ID 用最新版 **SideStore**；付费账号用
-   `Scripts/sign-ipa.sh` 或 Xcode。（runner 内嵌 `PlugIns/iCTRLUITests.xctest`，
-   必须从内到外单独签名，普通签名器会漏签导致启动即崩溃。）
-2. **挂载 Developer Disk Image (DDI)**：XCUITest 依赖 `testmanagerd`，只有挂载
-   DDI 时才存在。**每次重启都要重新挂载**。有 Mac+Xcode 可自动挂载；没有则用
-   StikDebug 或 iCTRL App 在设备上挂载。
+本机曾在 iPhone `192.168.1.6:8200` 验证，地址受 DHCP 影响。Bridge 在项目 `.env` 配置 `ICTRL_HOST`，设备换 IP 后也需重新确认按 host:port 保存的配对记录。
 
-先开 **设置 → 隐私与安全性 → 开发者模式**，重启。
+## 构建与启动（已验证路线）
 
-## 安装
-
-- **免费 Apple ID**：iLoader 装 SideStore → App Store 装 **LocalDevVPN** 并连接
-  → SideStore → My Apps → `+` → 选 `iCTRLUITests-Runner.ipa`
-  → 设置 → 通用 → VPN 与设备管理 → 信任证书。
-  （免费证书 7 天到期，需用 SideStore 刷新。）
-- **付费账号**：`Scripts/sign-ipa.sh` 签名，或 Xcode 直接跑。
-
-## 启动 runner
-
-1. 在手机上启动 iCTRL runner（**真正干活的这个**）。
-2. 允许**通知**和**本地网络**权限。
-3. runner 的通知里长按可：✅ 批准配对 / 🌐 开启 Remote Access / 🛑 停止服务。
-
-> 默认只监听 `127.0.0.1`。主机不在手机上时，必须打开 **🌐 Remote Access**，
-> 且主机与手机在**同一 Wi-Fi**。蜂窝网络下 LAN 不可达。
-
-## 主机侧配对
+开启手机开发者模式，连接并信任 Mac，确认 Xcode 能识别设备；手机启动时保持解锁。已有签名配置不必重新生成，首次环境再配置自己的开发团队。
 
 ```bash
-cd host
-bridge pair --host <手机IP>:8200
-# 手机弹出配对通知 → 点 Allow
-bridge doctor            # 验证 device_info / skill_version
+cd /Users/haoyu/code/ictrl
+# 仅初次配置：填写自己的团队 ID
+DEVELOPMENT_TEAM=<团队ID> ./Scripts/setup-signing.sh
+xcodegen generate
+xcodebuild build-for-testing -project iCTRL.xcodeproj -scheme iCTRL \
+  -derivedDataPath build -destination "generic/platform=iOS" \
+  -allowProvisioningUpdates ARCHS=arm64
+xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
+  -derivedDataPath build -destination "id=<设备UDID>" -allowProvisioningUpdates
 ```
 
-配对密钥缓存在 `~/.ictrl/token.json`，**按 host:port 存**（DHCP 换 IP 需要重配）。
-密钥 30 天未用会过期；只有真的返回 `401` 才重新配对。
+本机今天已恢复并部署此测试会话。Runner 的 UI 操作授权依赖测试会话，不能只因 App 存活或 `/schema` 可访问就认定 UI 已就绪。不要并行启动多个测试会话控制同一手机。
 
-## 交给 Hermes
+开发者镜像 DDI 是运行条件，手机重启后需要确认仍已挂载；Xcode 或设备端挂载路径见下方历史排错。Runner 标识需保留 `.xctrunner` 后缀，历史重签名改写后缀曾导致 XCTest 加载失败。
 
-iCTRL 自带 skill，直接把它装成 Hermes skill（见 `host/bridge/cli.py:install-skill`），
-然后对 Hermes 说：
+## 配对与 UI 核查
 
-> "我的 iPhone 在 iCTRL 上运行，地址 `<IP>:8200`，想办法驱动它。"
+在 Runner 允许通知和本地网络权限，通过通知打开 **Remote Access**，主机与手机保持网络可达。
 
-Hermes 会读 `GET /skill`、`GET /schema`，从设备下载客户端，发起配对。
+```bash
+cd /Users/haoyu/dayu-dot/host
+./.venv/bin/python -m bridge.cli pair --host <手机IP>:8200
+# 手机通知批准配对后核查
+./.venv/bin/python -m bridge.cli doctor
+./.venv/bin/python -m bridge.cli phone page_source '{"max_elements":40}'
+```
 
-## 排错
+仅首次或确实返回配对失效时重新 `pair`；配对记录位于 `~/.ictrl/token.json`，不要写入项目文档。`doctor` 检查配置和健康接口，实际 `page_source` 成功才能验证 UI 调用权限。读屏诊断前确认没有其他正在执行的手机任务。
 
-| 现象 | 处理 |
+## 今天的打开应用提速
+
+本机 Runner 的 `launch_app` 增加参数：
+
+| `launch_mode` | 行为 |
 |---|---|
-| `/schema` 打不开 | runner 没在跑，让用户启动（DDI 每次重启会丢） |
-| `401` | 密钥失效，重新 `pair` |
-| UI 调用连续超时 | `reset`，然后每几秒轮询 `logs` 直到卡住的调用结束（15–45s），别发长 `sleep` |
-| 屏幕锁屏 | `unlock` 只点亮屏幕；需要密码时要用户处理 |
-| 只有 `logs`/`config`/`reset` 有响应 | UI 队列被卡住的调用占住，正常——用它诊断 |
+| `ready` | 默认，保持原有前台切换、弹窗检查和首屏稳定观察 |
+| `foreground` | 前台切换和启动弹窗检查后返回，省去首屏稳定等待；必须再读屏核查 |
+
+Bridge 默认 `PHONE_FAST_LAUNCH=true`，使用 `foreground` 后立即读屏；确实仍在加载或空白时最多按 `PHONE_READY_READS=3` 有界重读。该优化不跳过任务确认、页面核验或未知结果处理。
+
+2026-10-17 对同一已运行淘宝 App 的少量交替样本：普通启动 2.42 / 1.23 秒，快速启动 0.54 / 0.48 秒；启动加首次读屏分别为 3.77 / 1.78 秒与 1.15 / 1.03 秒。记录在 `.runtime/launch-benchmark.json`，不是冷启动或所有 App 的延时保证。
+
+## 默认 direct 与可选 Hermes
+
+默认 Bridge 直接调用千问，并通过固定手机工具使用官方加密客户端；不需要每个任务读取 `/skill` 或启动 Hermes。官方客户端仍保留在 `host/vendor/ictrl_rpc.py`，本机局域网 HTTP 由 curl 适配。
+
+显式设 `BRIDGE_AGENT_BACKEND=hermes` 时才使用 Hermes CLI。需要安装技能可运行：
+
+```bash
+cd /Users/haoyu/dayu-dot/host
+./.venv/bin/python -m bridge.cli install-skill
+```
+
+该命令是可选 Hermes 后端的准备步骤，不是默认 direct 路径的前置条件。
+
+## 恢复与排错
+
+| 现象 | 当前处理 |
+|---|---|
+| `/schema` 或 `/skill` 不可达 | 检查地址、Remote Access、网络、Runner 测试会话和 DDI |
+| 健康接口通但 `Not authorized for performing UI testing actions` | 恢复 `xcodebuild test-without-building` 会话，再实际读屏验证 |
+| 手机锁屏或需要密码 | 解锁后继续；不能把点亮屏幕当成已完成解锁 |
+| 返回 `401` / 配对失效 | 确认 host:port，重新配对并在手机批准 |
+| UI 调用超时、操作结果未知 | 停止重复派发，检查手机和 Runner 日志；必要时使用诊断 `logs` / `reset`，清理后核对实际结果 |
+| 明确 `Could not open '<bundle_id>'...` | 任务按普通启动失败结束，检查应用是否安装及标识是否正确；不因该固定拒绝消息要求重启 Bridge |
+| Bridge 报手机通道已暂停 | 本地收尾或动作结果无法确认；核对实际手机状态、处理 Runner 故障，再安全重启 Bridge；不自动重跑旧任务 |
+| Python 访问 LAN 报 `No route to host`，curl 正常 | 检查 macOS 本地网络权限；项目保留 curl 适配，见历史记录 |
+
+本机日志为 `~/.dayu/logs/ictrl-runner.log`、`bridge.log`，任务详情位于 `.runtime/direct/<trace_id>/`。桥接服务重启与 Runner 重启是不同步骤，不应把所有应用失败都归结为重启网关。
+
+## 历史安装与网络排错记录（2026-10-16）
+
+以下保留本机当时遇到的版本、服务器、签名和 DDI 问题；其中第三方服务与版本状态可能变化。当前已验证部署方式以本文前半部分为准。
 
 ## iLoader 登录 Apple ID 失败
 
@@ -144,20 +164,9 @@ SideStore → **设置 → 高级（Advanced）→ Anisette** → 把 **`Client 
 >
 > 相关 issue：#1657（修复）、#1658 / #1652（仍复现）。
 
-## 路线选择：SideStore 卡住时，用 iLoader 直接装 runner
+## 历史失败路线：iLoader 直接安装 Runner
 
-当 SideStore 登录被 Apple 挡住（`-80045` / `-1005`，见症状 D）时，可以绕过它：
-
-**iLoader → Import IPA → `iCTRLUITests-Runner.ipa`**（iPhone 用 USB 连接）。
-
-为什么可行：isideload 的 `isideload/src/sideload/bundle.rs` 会把 **`PlugIns/` 下
-的内容全部当作 app extension 签名**，而 runner 的嵌套测试包正好是
-`PlugIns/iCTRLUITests.xctest`，因此会被一并签名。
-
-代价：iLoader 没有 7 天自动续签，免费证书到期需重新 Import。
-
-> 验证方法：装好后**立刻启动 runner**。能起来即签名正确；若报
-> `mapped file has no cdhash` 则说明没签上，回退 SideStore。
+本机曾尝试 iLoader 导入 IPA及修改嵌套测试包标识；先遇到 bundle ID 校验，绕过后又出现 XCTest 加载和启动问题。这条路径未完成可用 Runner 验收，下面仅保留当时排错记录，不作为当前部署步骤。当前使用本文开头的 Xcode 路线。
 
 ### iLoader 报 `Invalid bundle: Extension ... is not part of the main app bundle identifier`
 
@@ -175,9 +184,9 @@ X="Payload/iCTRLUITests-Runner.app/PlugIns/iCTRLUITests.xctest/Info.plist"
 zip -q -r -X ~/Downloads/ictrl/iCTRLUITests-Runner-patched.ipa Payload
 ```
 
-再用 iLoader → Import IPA 装 `iCTRLUITests-Runner-patched.ipa`。
+历史尝试中曾导入 `iCTRLUITests-Runner-patched.ipa`，但未解决最终启动问题。
 
-> 这是绕过 isideload 校验的权宜手段；iCTRL 官方路线仍是 SideStore。
+> 修改包标识只能绕过当时的校验，不代表 XCTest Runner 已具备运行条件。
 
 ### 症状 E：SideStore 登录报 `-1005`（kCFURLErrorNetworkConnectionLost）
 
@@ -248,15 +257,6 @@ macOS 的**「本地网络」权限**会拦截 node/python/ruby 等运行时对�
 `[Errno 65] No route to host`。
 
 **处理**：`host/bridge/ictrl.py` 把 iCTRL 官方客户端的 HTTP 层换成 `curl`
-（monkeypatch `_post`），加密逻辑不变；`_get` 也走 curl。这样 bridge 与 Hermes 都能访问手机。
+（monkeypatch `_post`），加密逻辑不变；健康和技能读取也经 `IctrlClient` 的 curl 适配。这样 Bridge 与可选 Hermes 后端都能访问手机。
 
 > 根治办法：系统设置 → 隐私与安全性 → **本地网络** → 给终端 App 授权。
-
-## 已跑通的完整链路（2026-10-16）
-
-```
-bridge ask "…"  →  hermes -z  →  iCTRL (:8200)  →  iPhone
-```
-- `bridge doctor` 全 OK（skill=1.98.12）
-- `bridge pair` 成功（`client_name` 不能为 null，否则服务端报 "client_name is required"）
-- `bridge install-skill` 已把 `/skill` 装进 Hermes（`~/.hermes/skills/phone-control/ictrl-phone-control/`）

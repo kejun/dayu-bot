@@ -1,90 +1,82 @@
-/*
- * ds-bot — Mini Agent Assistant 的 ESP32 终端界面
- *
- * 屏幕：Waveshare ESP32-S3-Touch-AMOLED-2.16（480×480 CO5300 QSPI + CST9220 触摸）
- * UI  ：LVGL 9 + U-Face 精灵素材（6 组表情 / 18 帧，256px RGB565A8）
- * 音频：ES7210 麦克风 + ES8311 扬声器（16kHz 单声道 16bit）
- * 按键：Key3=GPIO18、Key2=GPIO0（中间键 PWRON 保留电源功能）
- * 网络：WiFi → 主机 bridge serve（WebSocket + 终端协议 v1）
- *
- * 闭环：按住说话 → 录 16kHz PCM → 上传主机 → 主机 STT/Agent/iCTRL →
- *       状态/追问/结果回传 → 精灵表情 + 语音播报
- */
+/* ESP32 terminal: serialized audio uploads and acknowledged task cancellation. */
 #include <stddef.h>
+#include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "cJSON.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
-
 #include "bluebot_assets.h"
 #include "bluebot_player.h"
 #include "dsbot_font_32.h"
 #include "audio.h"
 #include "buttons.h"
+#include "input_policy.h"
 #include "net.h"
 #include "axp2101.h"
 
 static const char *TAG = "ds-bot";
-
 static bluebot_player_t s_pet;
-static lv_obj_t *s_face;
-static lv_obj_t *s_label;
-static lv_obj_t *s_net_label;
+static lv_obj_t *s_face, *s_label, *s_net_label;
 
-/* 终端状态（PRD §5.1） */
 typedef enum {
-    UI_IDLE,        /* 待机 */
-    UI_RECORDING,   /* 录音中 */
-    UI_PROCESSING,  /* 处理中 */
-    UI_SPEAKING,    /* 播报中 */
-    UI_OK,          /* 成功 */
-    UI_FAIL,        /* 失败 / 结果未确认 */
-    UI_STATE_COUNT
+    UI_IDLE, UI_RECORDING, UI_PROCESSING, UI_SPEAKING, UI_OK, UI_FAIL,
+    UI_CANCELLING, UI_CANCELLED, UI_CANCEL_UNCONFIRMED,
+    UI_LISTENING,
 } ui_state_t;
-
 static const bluebot_state_t k_face[] = {
-    [UI_IDLE] = BLUEBOT_IDLE,
-    [UI_RECORDING] = BLUEBOT_LISTEN,
-    [UI_PROCESSING] = BLUEBOT_THINK,
-    [UI_SPEAKING] = BLUEBOT_SPEAK,
-    [UI_OK] = BLUEBOT_HAPPY,
-    [UI_FAIL] = BLUEBOT_SAD,
+    BLUEBOT_IDLE, BLUEBOT_LISTEN, BLUEBOT_THINK, BLUEBOT_SPEAK,
+    BLUEBOT_HAPPY, BLUEBOT_SAD, BLUEBOT_THINK, BLUEBOT_IDLE, BLUEBOT_SAD,
+    BLUEBOT_LISTEN,
 };
-
 static const char *k_text[] = {
-    [UI_IDLE] = "待机",
-    [UI_RECORDING] = "录音中…",
-    [UI_PROCESSING] = "处理中…",
-    [UI_SPEAKING] = "播报中…",
-    [UI_OK] = "完成",
-    [UI_FAIL] = "失败",
+    "待机", "录音中…", "处理中…", "播报中…", "完成", "失败",
+    "正在取消…", "任务已经取消", "取消未确认",
+    "请说话…",
 };
 
+/* Protect task identity, button intent and UI ordering across WS / audio / key tasks. */
+static SemaphoreHandle_t s_state_lock;
 static ui_state_t s_state = UI_IDLE;
+static uint32_t s_ui_revision;
 static bool s_screen_on = true;
+static bool s_task_active, s_cancel_sent, s_ptt_busy, s_ptt_recording;
+static bool s_question_waiting, s_answer_listening;
+static uint32_t s_question_seq;
+static char s_task_id[96];
+static uint32_t s_task_epoch, s_boot_id, s_req_seq, s_wake_seq;
+static TickType_t s_cancel_started_at;
+#define CANCEL_ACK_TIMEOUT_MS 15000
+static input_policy_t s_input;
 
-/* 中间键（PWRON，走 AXP2101）短按：开/关屏幕 */
-static void on_pwrkey(void)
-{
-    s_screen_on = !s_screen_on;
-    bsp_display_brightness_set(s_screen_on ? 100 : 0);
-    ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
-}
+typedef enum { PTT_PRESS, PTT_RELEASE } ptt_evt_t;
+static QueueHandle_t s_ptt_q;
+typedef struct {
+    uint8_t *pcm;
+    size_t len;
+    uint32_t play_generation, speech_generation;
+    net_speech_t speech;
+} tts_item_t;
+static QueueHandle_t s_tts_q;
 
-/* ---------------------------------------------------------------- UI 更新 */
-static void ui_set_state_locked(ui_state_t st)
+/* Caller holds s_state_lock. */
+static void ui_set_state(ui_state_t state)
 {
-    s_state = st;
+    s_state = state;
+    ++s_ui_revision;
     bsp_display_lock(-1);
-    bluebot_player_set_state(&s_pet, k_face[st], lv_tick_get());
-    lv_label_set_text(s_label, k_text[st]);
+    bluebot_player_set_state(&s_pet, k_face[state], lv_tick_get());
+    lv_label_set_text(s_label, k_text[state]);
     bsp_display_unlock();
 }
 
@@ -95,194 +87,355 @@ static void ui_set_net_locked(const char *text)
     bsp_display_unlock();
 }
 
-/* ------------------------------------------------------- 主机消息 → 精灵 */
-static ui_state_t state_from_name(const char *s)
+static void on_pwrkey(void)
 {
-    if (!s) return UI_IDLE;
-    if (!strcmp(s, "recording"))  return UI_RECORDING;
-    if (!strcmp(s, "processing")) return UI_PROCESSING;
-    if (!strcmp(s, "need_user"))  return UI_PROCESSING;   /* 追问：先复用「思考」表情 */
-    return UI_IDLE;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    s_screen_on = !s_screen_on;
+    bsp_display_brightness_set(s_screen_on ? 100 : 0);
+    xSemaphoreGive(s_state_lock);
+}
+
+static void stop_speaking(void)
+{
+    net_discard_speech();
+    audio_play_cancel();
+    tts_item_t item;
+    while (s_tts_q && xQueueReceive(s_tts_q, &item, 0) == pdTRUE) free(item.pcm);
+}
+
+static void task_started(const char *rid)
+{
+    if (!s_task_active || strcmp(s_task_id, rid)) {
+        ++s_task_epoch;
+        s_cancel_sent = false;
+    }
+    strlcpy(s_task_id, rid, sizeof(s_task_id));
+    s_task_active = true;
+}
+
+static const char *json_string(cJSON *root, const char *key)
+{
+    cJSON *value = cJSON_GetObjectItem(root, key);
+    return cJSON_IsString(value) ? value->valuestring : "";
 }
 
 static void on_net_msg(const char *type, const char *json)
 {
     cJSON *root = cJSON_Parse(json);
-    if (!root) {
-        return;
-    }
-    cJSON *t = cJSON_GetObjectItem(root, "t");
-    const char *tt = cJSON_IsString(t) ? t->valuestring : type;
-
-    if (!strcmp(tt, "wake")) {
-        /* 唤醒：亮屏 + 进入「在听」状态 */
-        if (!s_screen_on) {
-            s_screen_on = true;
-            bsp_display_brightness_set(100);
-        }
-        ui_set_state_locked(UI_RECORDING);
+    if (!root) return;
+    const char *tt = json_string(root, "t");
+    if (!*tt) tt = type;
+    const char *rid = json_string(root, "request_id");
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    if (!strcmp(tt, "stop_speak")) {
+        stop_speaking();
+    } else if (!strcmp(tt, "wake")) {
+        s_screen_on = true;
+        bsp_display_brightness_set(100);
+        if (!s_task_active && !s_ptt_busy) ui_set_state(UI_RECORDING);
     } else if (!strcmp(tt, "welcome")) {
         ui_set_net_locked("已连接主机");
-    } else if (!strcmp(tt, "notice")) {
-        cJSON *txt = cJSON_GetObjectItem(root, "text");
-        cJSON *lvl = cJSON_GetObjectItem(root, "level");
-        const char *lv = cJSON_IsString(lvl) ? lvl->valuestring : "warn";
-        ESP_LOGW(TAG, "notice[%s]: %s", lv, cJSON_IsString(txt) ? txt->valuestring : "");
-        /* 出错时别一直卡在「处理中」 */
-        if (!strcmp(lv, "error")) {
-            ui_set_state_locked(UI_FAIL);
-        }
     } else if (!strcmp(tt, "status")) {
-        cJSON *st = cJSON_GetObjectItem(root, "state");
-        ui_set_state_locked(state_from_name(cJSON_IsString(st) ? st->valuestring : NULL));
+        const char *st = json_string(root, "state");
+        bool active = !strcmp(st, "processing") || !strcmp(st, "need_user") ||
+                      !strcmp(st, "cancelling") || !strcmp(st, "recognizing");
+        if (active && *rid && (!s_task_active || !strcmp(s_task_id, rid))) {
+            task_started(rid);
+            if (!strcmp(st, "cancelling")) {
+                if (!s_cancel_sent) s_cancel_started_at = xTaskGetTickCount();
+                s_cancel_sent = true;
+                s_question_waiting = s_answer_listening = false;
+                audio_wake_pause(false);
+                net_cancel_audio_uploads();
+                ui_set_state(UI_CANCELLING);
+            } else if (!s_cancel_sent) {
+                if (!strcmp(st, "processing")) s_question_waiting = s_answer_listening = false;
+                audio_wake_pause(!strcmp(st, "recognizing"));
+                ui_set_state(UI_PROCESSING);
+            }
+        } else if (!strcmp(st, "cancelled") && *rid && !strcmp(s_task_id, rid)) {
+            s_task_active = false;
+            s_cancel_sent = false;
+            s_question_waiting = s_answer_listening = false;
+            audio_wake_pause(false);
+            ui_set_state(UI_CANCELLED);
+        } else if (!s_task_active && !s_ptt_busy && !strcmp(st, "recording")) {
+            /* Background VAD must not replace an active phone task's state. */
+            ui_set_state(UI_RECORDING);
+        }
     } else if (!strcmp(tt, "question")) {
-        cJSON *txt = cJSON_GetObjectItem(root, "text");
-        ESP_LOGI(TAG, "question: %s", cJSON_IsString(txt) ? txt->valuestring : "");
-        ui_set_state_locked(UI_PROCESSING);
+        if (*rid && (!s_task_active || !strcmp(s_task_id, rid))) {
+            task_started(rid);
+            if (!s_cancel_sent) {
+                stop_speaking();
+                cJSON *seq = cJSON_GetObjectItem(root, "question_seq");
+                s_question_seq = cJSON_IsNumber(seq) ? (uint32_t)seq->valuedouble : 0;
+                s_question_waiting = true;
+                s_answer_listening = false;
+                audio_wake_pause(true);
+                ui_set_state(UI_SPEAKING);
+                ESP_LOGI(TAG, "question speaking: %s seq=%lu", rid, (unsigned long)s_question_seq);
+            }
+        }
+    } else if (!strcmp(tt, "listen")) {
+        cJSON *seq = cJSON_GetObjectItem(root, "question_seq");
+        if (s_task_active && s_question_waiting && !s_cancel_sent && !strcmp(s_task_id, rid) &&
+            cJSON_IsNumber(seq) && s_question_seq == (uint32_t)seq->valuedouble) {
+            s_answer_listening = true;
+            audio_wake_pause(false);
+            ui_set_state(UI_LISTENING);
+            ESP_LOGI(TAG, "question listening: %s seq=%lu", rid, (unsigned long)s_question_seq);
+        }
     } else if (!strcmp(tt, "result")) {
-        cJSON *kind = cJSON_GetObjectItem(root, "kind");
-        cJSON *txt  = cJSON_GetObjectItem(root, "text");
-        const char *k = cJSON_IsString(kind) ? kind->valuestring : "unknown";
-        ESP_LOGI(TAG, "result[%s]: %s", k, cJSON_IsString(txt) ? txt->valuestring : "");
-        ui_set_state_locked(!strcmp(k, "success") ? UI_OK : UI_FAIL);
+        if (*rid && (!*s_task_id || !strcmp(s_task_id, rid))) {
+            strlcpy(s_task_id, rid, sizeof(s_task_id));
+            bool was_cancelling = s_cancel_sent || s_state == UI_CANCEL_UNCONFIRMED;
+            s_task_active = false;
+            s_cancel_sent = false;
+            s_question_waiting = s_answer_listening = false;
+            audio_wake_pause(false);
+            const char *kind = json_string(root, "kind");
+            if (!strcmp(kind, "cancelled")) {
+                ui_set_state(UI_CANCELLED);
+            } else if (was_cancelling && !strcmp(kind, "unknown")) {
+                ui_set_state(UI_CANCEL_UNCONFIRMED);
+            } else {
+                ui_set_state(!strcmp(kind, "success") ? UI_OK : UI_FAIL);
+            }
+        }
+    } else if (!strcmp(tt, "notice")) {
+        if (!strcmp(json_string(root, "level"), "error")) {
+            if (s_cancel_sent) ui_set_state(UI_CANCEL_UNCONFIRMED);
+            else if (!s_task_active) ui_set_state(UI_FAIL);
+        }
     }
+    xSemaphoreGive(s_state_lock);
     cJSON_Delete(root);
 }
 
-/* ------------------------------------------------------------------- PTT */
-typedef enum { PTT_PRESS, PTT_RELEASE } ptt_evt_t;
-static QueueHandle_t s_ptt_q;
-static uint32_t s_req_seq;
-
-static void ptt_post(ptt_evt_t e)
+/* Button edges only classify intent. Upload/playback cannot delay the hold timer. */
+static void on_button(int gpio, bool pressed)
 {
-    if (s_ptt_q) {
-        xQueueSend(s_ptt_q, &e, 0);
+    int key = gpio == BTN_GPIO_KEY3 ? 0 : 1;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    input_action_t action = input_policy_edge(&s_input, key, pressed,
+            s_task_active, s_task_epoch, !s_ptt_busy,
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+    if (action == INPUT_RECORD_START) {
+        s_ptt_busy = true;
+        s_ptt_recording = true;
+        stop_speaking();
+    }
+    if (action == INPUT_RECORD_START || action == INPUT_RECORD_STOP) {
+        ptt_evt_t event = action == INPUT_RECORD_START ? PTT_PRESS : PTT_RELEASE;
+        if (xQueueSend(s_ptt_q, &event, 0) != pdTRUE) {
+            /* Only one owner can enqueue a press/release pair; queue overflow is an error. */
+            ESP_LOGE(TAG, "PTT event queue full");
+        }
+    }
+    xSemaphoreGive(s_state_lock);
+}
+
+static void cancel_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        char rid[sizeof(s_task_id)] = "";
+        uint32_t epoch = 0;
+        bool send = false;
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        if (s_task_active && s_cancel_sent &&
+            xTaskGetTickCount() - s_cancel_started_at >= pdMS_TO_TICKS(CANCEL_ACK_TIMEOUT_MS)) {
+            s_cancel_sent = false;
+            ui_set_state(UI_CANCEL_UNCONFIRMED);
+            /* Holding stays one-shot; release and press again to retry. */
+        }
+        input_action_t action = input_policy_poll(&s_input, s_task_active,
+                s_task_epoch, (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        if (action == INPUT_CANCEL && !s_cancel_sent) {
+            s_cancel_sent = true;
+            s_cancel_started_at = xTaskGetTickCount();
+            epoch = s_task_epoch;
+            strlcpy(rid, s_task_id, sizeof(rid));
+            stop_speaking();
+            s_question_waiting = s_answer_listening = false;
+            audio_wake_pause(false);
+            ui_set_state(UI_CANCELLING);
+            send = true;
+        }
+        xSemaphoreGive(s_state_lock);
+        if (send) {
+            char msg[192];
+            snprintf(msg, sizeof(msg), "{\"v\":\"1\",\"t\":\"cancel\",\"request_id\":\"%s\"}", rid);
+            esp_err_t err = net_send_json(msg);
+            /* Send cancel before aborting the upload, so the host still knows its ID. */
+            if (err == ESP_OK) net_cancel_audio_uploads();
+            if (err != ESP_OK) {
+                xSemaphoreTake(s_state_lock, portMAX_DELAY);
+                if (s_task_active && s_task_epoch == epoch) {
+                    s_cancel_sent = false;
+                    ui_set_state(UI_CANCEL_UNCONFIRMED);
+                }
+                xSemaphoreGive(s_state_lock);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 static void ptt_task(void *arg)
 {
     (void)arg;
-    ptt_evt_t e;
-    char rid[24];
+    ptt_evt_t event;
+    bool recording = false;
+    char rid[48] = "";
     while (1) {
-        if (xQueueReceive(s_ptt_q, &e, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_ptt_q, &event, portMAX_DELAY) != pdTRUE) continue;
+        if (event == PTT_PRESS) {
+            audio_wake_pause(true);
+            snprintf(rid, sizeof(rid), "r%08lx-%lu", (unsigned long)s_boot_id, (unsigned long)++s_req_seq);
+            recording = audio_record_start() == ESP_OK;
+            xSemaphoreTake(s_state_lock, portMAX_DELAY);
+            s_ptt_recording = recording;
+            if (!s_task_active) ui_set_state(recording ? UI_RECORDING : UI_FAIL);
+            xSemaphoreGive(s_state_lock);
             continue;
         }
-        if (e == PTT_PRESS) {
-            audio_wake_pause(true);              /* 录音时暂停空闲监听 */
-            snprintf(rid, sizeof(rid), "r%u", ++s_req_seq);
-            if (audio_record_start() == ESP_OK) {
-                ui_set_state_locked(UI_RECORDING);
-                if (net_connected()) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg),
-                             "{\"v\":\"1\",\"t\":\"audio_start\",\"request_id\":\"%s\",\"seq\":0}", rid);
-                    net_send_json(msg);
-                } else {
-                    ESP_LOGW(TAG, "未连主机，仅本地回放");
-                }
-            }
-        } else {
-            size_t n = audio_record_stop();
-            if (n > AUDIO_RATE_HZ * 2 / 5) {          /* >200ms */
-                if (net_connected()) {
-                    /* 上传：分块二进制帧 + audio_end */
-                    const uint8_t *p = audio_record_data();
-                    size_t off = 0;
-                    while (off < n) {
-                        size_t chunk = (n - off) > 4096 ? 4096 : (n - off);
-                        net_send_binary(p + off, chunk);
-                        off += chunk;
-                    }
-                    char msg[128];
-                    snprintf(msg, sizeof(msg),
-                             "{\"v\":\"1\",\"t\":\"audio_end\",\"request_id\":\"%s\",\"duration_ms\":%u}",
-                             rid, (unsigned)(n * 1000 / (AUDIO_RATE_HZ * 2)));
-                    net_send_json(msg);
-                    ESP_LOGI(TAG, "uploaded %u bytes, rid=%s", (unsigned)n, rid);
-                    ui_set_state_locked(UI_PROCESSING);
-                } else {
-                    ESP_LOGI(TAG, "本地回放 %u bytes", (unsigned)n);
-                    ui_set_state_locked(UI_SPEAKING);
-                    audio_play(audio_record_data(), n);
-                    ui_set_state_locked(UI_IDLE);
-                }
-            } else {
-                ESP_LOGI(TAG, "太短，忽略 (%u bytes)", (unsigned)n);
-                if (net_connected()) {
-                    char msg[96];
-                    snprintf(msg, sizeof(msg),
-                             "{\"v\":\"1\",\"t\":\"audio_abort\",\"request_id\":\"%s\"}", rid);
-                    net_send_json(msg);
-                }
-                ui_set_state_locked(UI_IDLE);
-            }
-            audio_wake_pause(false);             /* 恢复空闲监听 */
+        size_t len = recording ? audio_record_stop() : 0;
+        recording = false;
+        bool upload = false;
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        s_ptt_recording = false;
+        if (len > AUDIO_RATE_HZ * 2 / 5 && !s_task_active && net_connected()) {
+            task_started(rid); /* Include STT and upload in the cancellable busy interval. */
+            ui_set_state(UI_PROCESSING);
+            upload = true;
         }
+        bool offline_play = len > AUDIO_RATE_HZ * 2 / 5 && !s_task_active && !net_connected();
+        xSemaphoreGive(s_state_lock);
+        if (upload) {
+            esp_err_t err = net_send_audio_clip(rid, "task", audio_record_data(), len);
+            if (err != ESP_OK) {
+                xSemaphoreTake(s_state_lock, portMAX_DELAY);
+                if (s_task_active && !s_cancel_sent && s_state != UI_CANCEL_UNCONFIRMED && !strcmp(s_task_id, rid)) {
+                    s_task_active = false;
+                    ui_set_state(UI_FAIL);
+                }
+                xSemaphoreGive(s_state_lock);
+            }
+        } else if (offline_play) {
+            audio_play(audio_record_data(), len);
+        }
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        s_ptt_busy = false;
+        if (!s_task_active && s_state == UI_RECORDING) ui_set_state(UI_IDLE);
+        xSemaphoreGive(s_state_lock);
+        /* Processing and need_user keep VAD alive for spoken cancellation. */
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        audio_wake_pause(s_question_waiting && !s_answer_listening);
+        xSemaphoreGive(s_state_lock);
     }
 }
-
-/* ---- 唤醒词：空闲片段上传主机 ---- */
-static uint32_t s_wake_seq;
 
 static void on_wake_clip(const void *pcm, size_t len)
 {
-    if (!net_connected()) {
-        return;
+    if (!net_connected()) return;
+    char rid[48], answer_to[sizeof(s_task_id)] = "";
+    uint32_t question_seq = 0;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    if (s_question_waiting) {
+        if (!s_answer_listening || s_cancel_sent) {
+            xSemaphoreGive(s_state_lock);
+            return;
+        }
+        strlcpy(answer_to, s_task_id, sizeof(answer_to));
+        question_seq = s_question_seq;
+        s_answer_listening = false;
+        audio_wake_pause(true);
+        ui_set_state(UI_PROCESSING);
     }
-    char rid[24], msg[160];
-    snprintf(rid, sizeof(rid), "w%u", ++s_wake_seq);
-    snprintf(msg, sizeof(msg),
-             "{\"v\":\"1\",\"t\":\"audio_start\",\"request_id\":\"%s\",\"mode\":\"wake\"}", rid);
-    net_send_json(msg);
-    const uint8_t *p = (const uint8_t *)pcm;
-    for (size_t off = 0; off < len; off += 4096) {
-        size_t n = (len - off) > 4096 ? 4096 : (len - off);
-        net_send_binary(p + off, n);
+    xSemaphoreGive(s_state_lock);
+    snprintf(rid, sizeof(rid), "w%08lx-%lu", (unsigned long)s_boot_id, (unsigned long)++s_wake_seq);
+    esp_err_t err = *answer_to ? net_send_answer_clip(rid, answer_to, question_seq, pcm, len) :
+                                net_send_audio_clip(rid, "wake", pcm, len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wake upload failed: %s", esp_err_to_name(err));
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        if (*answer_to && s_question_waiting && !s_cancel_sent &&
+            !strcmp(answer_to, s_task_id) && question_seq == s_question_seq) {
+            s_answer_listening = true;
+            ui_set_state(UI_LISTENING);
+            audio_wake_pause(false);
+        }
+        xSemaphoreGive(s_state_lock);
     }
-    snprintf(msg, sizeof(msg),
-             "{\"v\":\"1\",\"t\":\"audio_end\",\"request_id\":\"%s\",\"mode\":\"wake\","
-             "\"duration_ms\":%u}", rid, (unsigned)(len * 1000 / (AUDIO_RATE_HZ * 2)));
-    net_send_json(msg);
 }
 
-/* ---- 主机语音（TTS）播放 ---- */
-typedef struct { uint8_t *pcm; size_t len; } tts_item_t;
-static QueueHandle_t s_tts_q;
-
-static void on_tts_audio(uint8_t *pcm, size_t len)   /* WS 任务上下文 */
+static void speech_done(const net_speech_t *speech, bool ok)
 {
-    tts_item_t it = { pcm, len };
-    if (!s_tts_q || xQueueSend(s_tts_q, &it, 0) != pdTRUE) {
-        free(pcm);                                   /* 队列满则丢弃 */
-    }
+    if (!*speech->request_id) return;
+    cJSON *msg = cJSON_CreateObject();
+    if (!msg) return;
+    cJSON_AddStringToObject(msg, "v", "1");
+    cJSON_AddStringToObject(msg, "t", "speak_done");
+    cJSON_AddStringToObject(msg, "request_id", speech->request_id);
+    cJSON_AddNumberToObject(msg, "question_seq", speech->question_seq);
+    cJSON_AddNumberToObject(msg, "audio_id", speech->audio_id);
+    cJSON_AddBoolToObject(msg, "ok", ok);
+    char *json = cJSON_PrintUnformatted(msg);
+    esp_err_t err = json ? net_send_json(json) : ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "question playback done: %s seq=%lu ok=%d ack=%s", speech->request_id,
+             (unsigned long)speech->question_seq, ok, esp_err_to_name(err));
+    free(json);
+    cJSON_Delete(msg);
+}
+
+static void on_tts_audio(uint8_t *pcm, size_t len, uint32_t generation, const net_speech_t *speech)
+{
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    tts_item_t item = {.pcm = pcm, .len = len, .play_generation = audio_play_generation(),
+                       .speech_generation = generation, .speech = *speech};
+    bool valid = generation == net_speech_generation() && !s_ptt_recording;
+    bool queued = valid && s_tts_q && xQueueSend(s_tts_q, &item, 0) == pdTRUE;
+    if (!queued) free(pcm);
+    xSemaphoreGive(s_state_lock);
+    if (valid && !queued) speech_done(speech, false);
 }
 
 static void tts_task(void *arg)
 {
     (void)arg;
-    tts_item_t it;
+    tts_item_t item;
     while (1) {
-        if (xQueueReceive(s_tts_q, &it, portMAX_DELAY) != pdTRUE) {
-            continue;
+        if (xQueueReceive(s_tts_q, &item, portMAX_DELAY) != pdTRUE) continue;
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        bool valid = item.play_generation == audio_play_generation() &&
+                     item.speech_generation == net_speech_generation() && !s_ptt_recording;
+        /* Questions animate speaking; terminal results remain visible during result audio. */
+        bool question = *item.speech.request_id && s_task_active && s_question_waiting &&
+                        !s_cancel_sent && !strcmp(item.speech.request_id, s_task_id) &&
+                        item.speech.question_seq == s_question_seq;
+        if (*item.speech.request_id && !question) valid = false;
+        bool show_speaking = valid && (question || (!s_task_active &&
+                              (s_state == UI_IDLE || s_state == UI_SPEAKING)));
+        if (show_speaking) ui_set_state(UI_SPEAKING);
+        uint32_t revision = s_ui_revision;
+        xSemaphoreGive(s_state_lock);
+        esp_err_t played = valid ? audio_play_current(item.pcm, item.len, item.play_generation) :
+                                  ESP_ERR_INVALID_STATE;
+        free(item.pcm);
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        bool acknowledge = valid && question && s_question_waiting && !s_cancel_sent &&
+                           !strcmp(item.speech.request_id, s_task_id) && item.speech.question_seq == s_question_seq &&
+                           item.play_generation == audio_play_generation() &&
+                           item.speech_generation == net_speech_generation();
+        if (show_speaking && revision == s_ui_revision &&
+            item.play_generation == audio_play_generation() && !s_task_active && !s_ptt_busy) {
+            ui_set_state(UI_IDLE);
         }
-        ESP_LOGI(TAG, "播放主机语音 %u 字节", (unsigned)it.len);
-        audio_wake_pause(true);
-        ui_set_state_locked(UI_SPEAKING);
-        audio_play(it.pcm, it.len);
-        free(it.pcm);
-        ui_set_state_locked(UI_IDLE);
-        audio_wake_pause(false);
+        xSemaphoreGive(s_state_lock);
+        if (acknowledge) speech_done(&item.speech, played == ESP_OK);
     }
-}
-
-/* ------------------------------------------- 事件源：只有物理键 */
-static void on_button(int gpio, bool pressed)
-{
-    ESP_LOGI(TAG, "button GPIO%d %s", gpio, pressed ? "down" : "up");
-    ptt_post(pressed ? PTT_PRESS : PTT_RELEASE);
 }
 
 /* ------------------------------------------------------------------ LVGL */
@@ -316,6 +469,7 @@ void app_main(void)
     /* 屏幕不再触发录音：只保留物理键 + 语音唤醒（用户要求） */
 
     s_net_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_net_label, &dsbot_font_32, 0);
     lv_obj_set_style_text_color(s_net_label, lv_color_hex(0x8894A8), 0);
     lv_label_set_text(s_net_label, "连接中…");
     lv_obj_align(s_net_label, LV_ALIGN_TOP_MID, 0, 18);
@@ -337,14 +491,13 @@ void app_main(void)
 
     bsp_display_unlock();
 
+    s_state_lock = xSemaphoreCreateMutex();
     s_ptt_q = xQueueCreate(8, sizeof(ptt_evt_t));
-    xTaskCreate(ptt_task, "dsbot_ptt", 4096, NULL, 6, NULL);
-
     s_tts_q = xQueueCreate(4, sizeof(tts_item_t));
-    xTaskCreate(tts_task, "dsbot_tts", 4096, NULL, 6, NULL);
+    assert(s_state_lock && s_ptt_q && s_tts_q);
+    input_policy_init(&s_input);
+    s_boot_id = esp_random();
     net_set_tts_cb(on_tts_audio);
-    buttons_init(on_button);
-    axp2101_init(on_pwrkey);
 
     if (audio_init() == ESP_OK) {
         audio_play_tone(880, 150);
@@ -353,6 +506,12 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "audio_init failed");
     }
+
+    ESP_ERROR_CHECK(xTaskCreate(ptt_task, "dsbot_ptt", 4096, NULL, 6, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(tts_task, "dsbot_tts", 4096, NULL, 6, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(cancel_task, "dsbot_cancel", 4096, NULL, 6, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(buttons_init(on_button));
+    axp2101_init(on_pwrkey);
 
     ESP_LOGI(TAG, "U-Face ready (%dx%d)", BLUEBOT_WIDTH, BLUEBOT_HEIGHT);
     ESP_LOGI(TAG, "heap@ui: internal=%uK psram=%uK",

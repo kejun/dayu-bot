@@ -1,20 +1,19 @@
-"""本地语音识别：whisper.cpp（免费、离线、无需 API key）。
-
-终端上传的是 16kHz/单声道/16bit PCM（docs/protocol-v1.md），这里包成 WAV
-再交给 `whisper-cli` 识别。用简体中文的 initial prompt 引导输出简体
-（whisper 默认倾向繁体）。
-"""
+"""Qwen cloud ASR: PCM → in-memory WAV → direct HTTPS request."""
 from __future__ import annotations
 
 import asyncio
-import shutil
+import base64
+import logging
+import math
 import struct
-import subprocess
-import tempfile
-from pathlib import Path
+import time
 
-# 引导简体中文输出（whisper 不加这句会输出繁体）
-SIMPLIFIED_PROMPT = "以下是普通话的句子，请使用简体中文。"
+import httpx
+
+from .config import Config
+from .qwen import validate_endpoint
+
+log = logging.getLogger(__name__)
 
 
 class SttError(RuntimeError):
@@ -22,7 +21,6 @@ class SttError(RuntimeError):
 
 
 def _wav_bytes(pcm: bytes, rate: int, channels: int, bits: int) -> bytes:
-    """给裸 PCM 加一个 WAV 头。"""
     block_align = channels * bits // 8
     byte_rate = rate * block_align
     return (
@@ -33,56 +31,90 @@ def _wav_bytes(pcm: bytes, rate: int, channels: int, bits: int) -> bytes:
     )
 
 
-class WhisperCpp:
-    def __init__(self, model: Path, binary: str = "whisper-cli",
-                 language: str = "zh", prompt: str = SIMPLIFIED_PROMPT,
-                 threads: int = 4, timeout: float = 60.0):
-        self.model = Path(model)
-        self.binary = binary
+class QwenAsr:
+    def __init__(self, api_key: str, base_url: str, model: str = "qwen3-asr-flash",
+                 language: str = "zh", timeout: float = 15.0,
+                 *, client: httpx.AsyncClient | None = None):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
         self.language = language
-        self.prompt = prompt
-        self.threads = threads
         self.timeout = timeout
+        self._client = client
+        self._owns_client = client is None
+
+    @classmethod
+    def from_config(cls, cfg: Config) -> "QwenAsr":
+        return cls(cfg.qwen_asr_api_key or cfg.qwen_api_key,
+                   cfg.qwen_asr_base_url or cfg.qwen_base_url,
+                   cfg.qwen_asr_model, cfg.qwen_asr_language, cfg.qwen_asr_timeout)
 
     def available(self) -> tuple[bool, str]:
-        if not shutil.which(self.binary):
-            return False, f"找不到 {self.binary}（brew install whisper.cpp）"
-        if not self.model.exists():
-            return False, f"找不到模型 {self.model}"
-        return True, f"{self.binary} + {self.model.name}"
+        if not self.api_key.strip():
+            return False, "请在项目 .env 填写 DASHSCOPE_API_KEY（或 QWEN_ASR_API_KEY）"
+        if not self.base_url:
+            return False, "请在项目 .env 填写 DASHSCOPE_BASE_URL（或 QWEN_ASR_BASE_URL）"
+        error = validate_endpoint(self.base_url)
+        if error:
+            return False, error
+        if not self.model.startswith("qwen"):
+            return False, "QWEN_ASR_MODEL 必须使用千问语音模型（qwen 开头）"
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            return False, "QWEN_ASR_TIMEOUT 必须大于 0"
+        return True, f"{self.model}，云端转写，超时 {self.timeout:g}s"
 
-    def transcribe_sync(self, pcm: bytes, rate: int = 16000,
-                        channels: int = 1, bits: int = 16) -> str:
+    async def transcribe(self, pcm: bytes, fmt: dict) -> str:
         ok, why = self.available()
         if not ok:
             raise SttError(why)
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-            wav_path = Path(fh.name)
-            fh.write(_wav_bytes(pcm, rate, channels, bits))
+        audio_format = {"codec": "pcm_s16le", "rate": 16000, "channels": 1, "bits": 16}
+        if any(fmt.get(key, value) != value for key, value in audio_format.items()):
+            raise SttError("语音识别仅支持 16kHz 单声道 16bit PCM")
+        if len(pcm) % 2 or len(pcm) > 16000 * 2 * 60:
+            raise SttError("PCM 数据长度无效或超过 60 秒")
+        if not pcm:
+            return ""
+        data = base64.b64encode(_wav_bytes(pcm, 16000, 1, 16)).decode("ascii")
+        payload = {
+            "model": self.model, "stream": False,
+            "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                "data": "data:audio/wav;base64," + data,
+            }}]}],
+            "asr_options": {"language": self.language, "enable_itn": False},
+        }
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=min(5, self.timeout)))
+        started = time.monotonic()
         try:
-            cmd = [self.binary, "-m", str(self.model), "-l", self.language,
-                   "-nt", "-t", str(self.threads), "-f", str(wav_path)]
-            if self.prompt:
-                cmd += ["--prompt", self.prompt]
-            proc = subprocess.run(cmd, capture_output=True, timeout=self.timeout)
-            if proc.returncode != 0:
-                raise SttError(f"whisper-cli 退出码 {proc.returncode}: "
-                               f"{proc.stderr.decode('utf-8', 'replace')[-300:]}")
-            return proc.stdout.decode("utf-8", "replace").strip()
-        except subprocess.TimeoutExpired as e:
-            raise SttError(f"识别超时（>{self.timeout}s）") from e
-        finally:
-            wav_path.unlink(missing_ok=True)
-
-    async def transcribe(self, pcm: bytes, fmt: dict) -> str:
-        """供 Bridge 使用的异步接口（SttFn 签名）。"""
-        return await asyncio.to_thread(
-            self.transcribe_sync, pcm,
-            int(fmt.get("rate", 16000)), int(fmt.get("channels", 1)),
-            int(fmt.get("bits", 16)),
-        )
+            # Native async I/O: task cancellation stops this request, with no
+            # worker thread, detached recognizer or recording left on disk.
+            response = await asyncio.wait_for(self._client.post(
+                self.base_url + "/chat/completions",
+                headers={"Authorization": "Bearer " + self.api_key}, json=payload,
+            ), self.timeout)
+            response.raise_for_status()
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            raise SttError(f"千问语音识别超时（>{self.timeout:g}s）") from exc
+        except httpx.HTTPStatusError as exc:
+            # Do not include remote error bodies: proxies may echo credentials
+            # or the audio payload. HTTP status is sufficient for diagnostics.
+            raise SttError(f"千问语音识别 HTTP {exc.response.status_code}，请检查凭据、地域和模型权限") from exc
+        except httpx.RequestError as exc:
+            raise SttError("千问语音识别连接失败，请检查 Base URL 和网络") from exc
+        try:
+            text = response.json()["choices"][0]["message"]["content"]
+            if not isinstance(text, str):
+                raise ValueError("content must be text")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise SttError("千问语音识别返回格式无效") from exc
+        log.info("千问转写完成 model=%s audio_ms=%d elapsed_ms=%d", self.model,
+                 len(pcm) // 32, (time.monotonic() - started) * 1000)
+        return text.strip()
 
     async def __call__(self, pcm: bytes, fmt: dict) -> str:
-        """让对象本身就能当作 SttFn 调用（Bridge 传的是 self.stt(...)）。"""
         return await self.transcribe(pcm, fmt)
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None

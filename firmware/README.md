@@ -1,59 +1,48 @@
 # 固件：Waveshare ESP32-S3-Touch-AMOLED-2.16
 
-## 硬件
+更新：2026-10-17。实际工程位于 [ds-bot/](ds-bot/)，已完成显示、音频、物理键、Wi-Fi/WebSocket、任务取消和语音澄清；当前握手固件版本为 **0.2.0**。
 
-| 项 | 值 |
+## 硬件与环境
+
+| 项目 | 项目使用的配置 |
 |---|---|
-| 芯片 | ESP32-S3（双核 + LP 核，Wi-Fi + BLE5） |
-| 板上 | **16MB Flash + 8MB PSRAM**（实测 `esptool flash_id`） |
-| 屏幕 | 2.16" AMOLED，368×448（QSPI 屏驱） |
-| 触摸 | 电容触摸（I2C） |
-| 音频 | 麦克风 + 扬声器，ES8311 codec（I2S） |
-| 其他 | AXP2101 电源管理、SD 卡槽、RTC 等 |
+| 主控 | ESP32-S3，双核 Xtensa LX7，Wi-Fi / BLE |
+| 存储 | 16MB Flash，8MB Octal PSRAM |
+| 屏幕 | CO5300，**480×480** AMOLED / QSPI；以当前 Waveshare BSP 的分辨率定义为准 |
+| 触摸 | CST9217 / CST9220，屏幕不用于触发录音 |
+| 音频 | ES7210 麦克风 ADC、ES8311 扬声器 codec，16kHz / 单声道 / 16bit PCM |
+| 按键 | Key2 GPIO0、Key3 GPIO18；中间 Key1 为 AXP2101 PWRON |
+| 开发环境 | ESP-IDF **5.5.5**、Python 3.13、Waveshare BSP、LVGL 9、`esp_codec_dev` |
 
-> 实测记录：`Chip type: ESP32-S3 (QFN56) rev v0.2`，`Embedded PSRAM 8MB`，
-> `Detected flash size: 16MB`。
+## 当前交互
 
-## 固件职责（PRD §4）
+- 空闲时左右录音键按住说话、松开上传；中间键短按开关屏幕。
+- 任务活跃时左右键转为取消入口，持续按住 2 秒即可发送取消，松手不另起任务。
+- VAD 音频上传主机后识别唤醒词和取消；设备不在本地运行千问或专用唤醒词模型。
+- 需要确认时显示说话动画并播报，实际播放完成后发回执，收到 `listen` 才显示“请说话”并接收回答。
+- 播放期间不收语音，持续排空麦克风缓冲；取消可中断旧播报和已排队音频。
+- 结果区分完成、失败、取消和未确认；精灵动画跟随真实状态，不能表示任意执行百分比。
 
-只做端侧该做的：按住录音、上传、状态显示、结果播放。**不理解语义、不直接控制手机。**
+当前 PTT 缓冲为 10 秒，VAD 单段最多约 5 秒、静音 900 毫秒后提交。主机允许接收 60 秒不代表固件具备 60 秒录音缓冲。
 
-- 屏幕 5 态：`idle / recording / processing / need_user / result`
-  （结果区分 `success / failed / cancelled / unknown`）
-- 按住按键录音，松开提交，单次 ≤60s；开始录音时停止播报
-- 通过 WiFi 用 `docs/protocol-v1.md` 的 v1 协议连主机
-- 桌宠动画只是状态的表现（第 5 阶段）
+## 工程结构
 
-## 在 ESP-IDF 下的依赖
-
-- ESP-IDF **v5.5.5**（已装：`~/esp/esp-idf`，`get_idf` 加载）
-- 屏幕/触摸/音频驱动优先复用 **Waveshare 官方示例**：
-  `waveshare/ESP32-S3-Touch-AMOLED-2.16`（BSP 或 examples），避免自己点屏
-- 音频走 ESP-IDF 自带 `esp_driver_i2s` + ES8311 驱动
-
-> 注意：`esp-dev-skill` 现有 recipes 覆盖 ESP-IDF / esp-agents-firmware /
-> esp-claw 等，**未包含 Waveshare 该型号**，因此固件以 Waveshare 官方仓库为准。
-
-## 目录规划（待建）
-
-```
+```text
 firmware/
 ├── README.md
-├── CMakeLists.txt
-├── sdkconfig.defaults
-├── partitions.csv          # 16MB
-├── main/
-│   ├── app_main.c
-│   ├── board.c/.h          # 屏幕/触摸/音频/按键初始化
-│   ├── audio.c/.h          # 录音 + 播放
-│   ├── ui.c/.h             # 5 状态界面 + 桌宠
-│   ├── net.c/.h            # WiFi + WebSocket v1 客户端（录音上传/状态接收）
-│   └── Kconfig.projbuild
-└── components/             # 如需
+└── ds-bot/
+    ├── CMakeLists.txt / partitions.csv / sdkconfig.defaults
+    ├── main/
+    │   ├── main.c                 # UI、任务身份、PTT、取消、播放回执
+    │   ├── audio.c / audio.h      # 采集、VAD、播放与取消代次
+    │   ├── input_policy.c / .h    # 两键归属、长按阈值、任务切换保护
+    │   ├── net.c / net.h          # Wi-Fi、WebSocket、串行音频上传
+    │   ├── buttons.c / buttons.h
+    │   ├── axp2101.c / axp2101.h
+    │   └── Kconfig.projbuild
+    ├── components/uface/          # 精灵素材与 32px 中文子集字体
+    ├── tests/test_input_policy.c
+    └── tools/                    # 素材、字体和原生按键测试
 ```
 
-## 下一步
-
-1. 拉取 Waveshare 官方 2.16 示例，确认 `idf.py build/flash` 在 v5.5.5 下通过
-2. 拆分出 board bring-up（显示 + 触摸 + 音频）
-3. 接入 `net.c` 与主机 `host/bridge` 的 v1 协议
+构建、配置和串口记录器维护见 [ds-bot README](ds-bot/README.md)，线路消息见[协议 v1](../docs/protocol-v1.md)。本次实机验证和仍待验收项见[开发计划](../docs/plan.md)。

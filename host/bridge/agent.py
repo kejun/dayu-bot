@@ -1,7 +1,6 @@
 """Agent 适配层：把用户指令交给现有 Agent（Hermes），拿回一句结果。
 
-不复用 Hermes 的内部 API，只调它的 CLI（`hermes -z`），这样它自己的模型、
-工具、技能、会话、记忆全都照常工作（PRD §4：复用现有 Agent）。
+通过 CLI（`hermes -z`）复用工具执行；项目独立配置将所有模型路由到千问。
 """
 from __future__ import annotations
 
@@ -10,6 +9,8 @@ import re
 import shutil
 from dataclasses import dataclass, field
 
+from .processes import run_process
+from .qwen import PROVIDER, QwenSettings
 from .tasks import ResultKind, Turn
 
 
@@ -23,6 +24,7 @@ class AgentResult:
     returncode: int = 0
     cancelled: bool = False
     stderr: str = ""
+    evidence: dict | None = None
 
 
 # 交给 Agent 的固定前言：只说明"手机在哪、怎么算完成"，具体怎么做由
@@ -51,8 +53,8 @@ iPhone 上的 iCTRL 服务地址是 {host}，用 iCTRL 的方式驱动它。
 其中 unknown 表示你无法确认外部操作是否真的完成。
 """
 
-_ASK_RE = re.compile(r"^AS[K]:\s*(.*)$", re.M)
-_DONE_RE = re.compile(r"^DONE:\s*([a-zA-Z]+)\s*[;；:：]?\s*(.*)$", re.M)
+_ASK_RE = re.compile(r"ASK:[ \t]*(.*)")
+_DONE_RE = re.compile(r"DONE:[ \t]*([a-zA-Z]+)[ \t]*[;；:：]?[ \t]*(.*)")
 _VALID = {"success", "failed", "cancelled", "unknown"}
 
 
@@ -62,18 +64,22 @@ def parse_reply(text: str) -> Turn:
     解析不到控制行时，退化为一条 unknown 结果，并把原文作为结果文本——
     宁可如实报“未确认”，也不误报成功。
     """
-    done = _DONE_RE.search(text)
+    # Only the final nonempty line is a control line. Earlier lines may be
+    # quoted messages or tool output, and must not turn a later failure into
+    # success or override a later question.
+    text = text.strip()
+    body, _, last = text.rpartition("\n")
+    last = last.strip()
+    done = _DONE_RE.fullmatch(last)
     if done:
         kind = done.group(1).lower()
         if kind not in _VALID:
             kind = "unknown"
-        body = (text[:done.start()] + text[done.end():]).strip()
-        summary = done.group(2).strip() or body
+        summary = done.group(2).strip() or body.strip() or "结果未确认"
         return Turn.done(ResultKind(kind), summary)
-    ask = _ASK_RE.search(text)
+    ask = _ASK_RE.fullmatch(last)
     if ask:
-        body = (text[:ask.start()] + text[ask.end():]).strip()
-        return Turn.question(ask.group(1).strip() or body or "需要补充信息")
+        return Turn.question(ask.group(1).strip() or body.strip() or "需要补充信息")
     return Turn.done(ResultKind.UNKNOWN, text.strip() or "结果未确认")
 
 
@@ -82,48 +88,65 @@ class Agent:
     bin: str = "hermes"
     timeout: int = 300
     args: list[str] = field(default_factory=list)
+    qwen: QwenSettings | None = None
+
+    @classmethod
+    def from_config(cls, cfg, args: list[str] | None = None) -> "Agent":
+        return cls(cfg.hermes_bin, cfg.agent_timeout,
+                   cfg.hermes_args if args is None else args, QwenSettings.from_config(cfg))
 
     def available(self) -> tuple[bool, str]:
+        if self.qwen is not None:
+            ok, why = self.qwen.available()
+            if not ok:
+                return False, why
+            # Routing must not be overridden by --hermes-args/config.json.
+            reserved = {"--model", "-m", "--provider", "--reasoning", "--base-url",
+                        "--api-key", "--profile", "--resume", "--continue", "-z", "--query"}
+            if any(arg.split("=", 1)[0] in reserved for arg in self.args):
+                return False, "hermes_args 不允许覆盖千问模型、provider、配置或会话"
         path = shutil.which(self.bin)
         if not path:
             return False, f"找不到 Agent 可执行文件 {self.bin!r}"
-        return True, path
+        return True, self.qwen.available()[1] if self.qwen else path
 
     async def ask(self, prompt: str, cancel: asyncio.Event | None = None) -> AgentResult:
-        """运行一次 one-shot 对话，返回最终文本。cancel 置位则终止子进程。"""
-        if not shutil.which(self.bin):
-            raise AgentError(f"找不到 Agent 可执行文件 {self.bin!r}")
-        proc = await asyncio.create_subprocess_exec(
-            self.bin, *self.args, "-z", prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        wait_task = asyncio.ensure_future(proc.communicate())
-        cancel_task = asyncio.ensure_future(cancel.wait()) if cancel else None
+        """运行 one-shot 对话；取消/超时须先停止并回收整个本地执行树。"""
+        if cancel is not None and cancel.is_set():
+            return AgentResult("", -1, cancelled=True)
+        ok, why = self.available()
+        if not ok:
+            raise AgentError(why)
+        argv = [self.bin, *self.args]
+        env = None
+        if self.qwen is not None:
+            env = self.qwen.prepare_environment()
+            argv += ["--model", self.qwen.model, "--provider", PROVIDER]
         try:
-            done, _ = await asyncio.wait(
-                {wait_task} | ({cancel_task} if cancel_task else set()),
-                timeout=self.timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            result = await run_process(
+                [*argv, "-z", prompt], timeout=self.timeout, cancel=cancel, env=env,
             )
-            if wait_task in done:
-                out, err = wait_task.result()
-                return AgentResult(out.decode("utf-8", "replace").strip(),
-                                   proc.returncode or 0,
-                                   stderr=err.decode("utf-8", "replace").strip())
-            # 超时或被取消
-            cancelled = cancel_task is not None and cancel_task in done
-            if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    proc.kill()
-            wait_task.cancel()
-            if cancelled:
-                return AgentResult("", proc.returncode or -1, cancelled=True)
-            raise AgentError(f"Agent 超过 {self.timeout}s 未返回")
-        finally:
-            for t in (wait_task, cancel_task):
-                if t and not t.done():
-                    t.cancel()
+        except asyncio.TimeoutError as exc:
+            raise AgentError(f"Agent 超过 {self.timeout}s 未返回") from exc
+        return AgentResult(
+            result.stdout.decode("utf-8", "replace").strip(), result.returncode,
+            cancelled=result.cancelled,
+            stderr=result.stderr.decode("utf-8", "replace").strip(),
+        )
+
+
+def make_agent(cfg, args: list[str] | None = None):
+    if cfg.agent_backend == "direct":
+        from .direct import DirectAgent
+        return DirectAgent(cfg)
+    if cfg.agent_backend == "hermes":
+        return Agent.from_config(cfg, args)
+    raise AgentError("BRIDGE_AGENT_BACKEND 仅支持 direct 或 hermes")
+
+
+def phone_prompt(agent, host: str, text: str, history: list[str] = ()) -> str:
+    preamble = getattr(agent, "phone_preamble", PHONE_PREAMBLE).format(host=host)
+    parts = [preamble, f"用户指令：{text}"]
+    if history:
+        parts.append("用户补充：" + "；".join(history))
+    return "\n\n".join(parts)

@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -29,6 +30,10 @@ size_t      audio_record_size(void);
 
 /* 播放一段 PCM */
 esp_err_t audio_play(const void *data, size_t len);
+/* stop_speak 使在途及已排队的旧 generation 播放失效。 */
+uint32_t audio_play_generation(void);
+void audio_play_cancel(void);
+esp_err_t audio_play_current(const void *data, size_t len, uint32_t generation);
 
 /* 播放一段固定频率的正弦音（自检用，不需要麦克风） */
 esp_err_t audio_play_tone(int freq_hz, int ms);
@@ -39,7 +44,7 @@ typedef void (*audio_clip_cb_t)(const void *pcm, size_t len);
 
 /* 启动空闲监听（VAD） */
 esp_err_t audio_wake_start(audio_clip_cb_t cb);
-/* 暂停/恢复（录音、播报时要暂停，避免抢麦克风） */
+/* 手动暂停/恢复（PTT 从按下到上传结束）；录音/播放期间另有内部互斥。 */
 void audio_wake_pause(bool pause);
 
 #ifdef __cplusplus
